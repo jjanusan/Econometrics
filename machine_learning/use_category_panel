@@ -21,7 +21,7 @@
 #    and predicted Y per row.
 
 # %%
-from catpanel import (
+from cat_panel import (
     step_load,
     step_explore,
     step_select,
