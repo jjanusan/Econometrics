@@ -1,0 +1,169 @@
+# ---
+# jupyter:
+#   jupytext:
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+# ---
+
+# %% [markdown]
+# # Checks for a categorical Y
+#
+# Run the cells from top to bottom. Each step has a button that must be
+# pressed before the next step makes sense. All steps share `state`.
+#
+# 1. Load: browse the folder or bucket and load files.
+# 1b. Explore: look at one column at a time before picking Y and X.
+# 2. Select: pick Y (categorical) and X, and filter rows on X values.
+# 3. Diagnostics: distribution of a numeric column per Y x categorical.
+# 4. Model: multinomial logit, selective editing, imputation, bootstrap
+#    and predicted Y per row.
+
+# %%
+from catpanel import (
+    step_load,
+    step_explore,
+    step_select,
+    step_diagnostics,
+    step_model,
+    attach_predictions,
+)
+
+# %% [markdown]
+# ## Step 1: pick files and load
+#
+# Use a local folder, or a path like "gs://your-bucket/folder" for
+# Google Cloud Storage.
+
+# %%
+state = step_load("gs://your-bucket/folder")
+
+# %% [markdown]
+# Alternative: skip the file browser and pass a data frame directly. Then you
+# can also make a categorical Y from a numeric column before you start.
+
+# %%
+# import pandas as pd
+# df = pd.read_parquet("my_file.parquet")
+# state = step_load(df=df)
+
+# %% [markdown]
+# ## Step 1b: column overview
+#
+# Pick one column at a time. Numeric gives mean, spread, quartiles and skew.
+# Categorical gives a frequency table, cut at 50 levels. Date gives the span
+# and the number of unique dates, years and months.
+#
+# Look for three things before moving on: columns with very many levels
+# (need grouping), columns with a lot missing, and columns with the wrong
+# data type, typically numbers stored as text.
+
+# %%
+step_explore(state)
+
+# %% [markdown]
+# ## Step 2: pick Y, X and filter rows
+#
+# Press "Apply and filter" when you are done. If you change anything
+# afterwards, press it again before step 3 and 4.
+
+# %%
+step_select(state)
+
+# %% [markdown]
+# ## Step 3: distribution checks
+#
+# Y is the first categorical column. Pick one more categorical column and
+# one numeric column.
+
+# %%
+step_diagnostics(state)
+
+# %% [markdown]
+# ## Step 4: model
+#
+# Required settings at the top, the rest under "Advanced settings".
+# Columns marked "may be None" can be set to "(none)".
+#
+# First time: set `n_bootstrap` low, for example 5, to see how long one round
+# takes. Raise it to at least 100 before you use the intervals for anything.
+
+# %%
+step_model(state)
+
+# %% [markdown]
+# ## Results
+#
+# - `state["filtered"]`: the data after filtering
+# - `state["selection"]`: Y, X and active filters
+# - `state["diagnostics"]`: summary table from step 3
+# - `state["settings"]`: the settings passed into step 4
+# - `state["result"]`: dict from step 4 with `data`, `X`, `model`, `probs`,
+#   `calibration`, `calibration_holdout`, `summary`, `bootstrap`, `flagged`,
+#   `imputation`, `predictions`, `settings`
+# - `state["predicted"]`: the data from step 2 with predicted Y per row
+
+# %% [markdown]
+# ### Shares in the target period, with bootstrap interval
+#
+# `outside = True` means the observed share is outside the interval the
+# model gives. Compare with `calibration_holdout` below before drawing a
+# conclusion: it shows how large the gap is in a period with no known problems.
+
+# %%
+state["result"]["summary"]
+
+# %%
+state["result"]["calibration_holdout"]
+
+# %% [markdown]
+# ### Rows to check
+#
+# The weakest rows, sorted by how unlikely the reported value is under the
+# model. Low probability means the row differs from the pattern, not that
+# it is wrong.
+
+# %%
+# state["result"]["flagged"].sort_values("p_reported").head(20)
+
+# %% [markdown]
+# ### Predicted Y per row
+#
+# The columns are called `predicted_Y` by default, set by `prediction_col`
+# under Advanced settings:
+#
+# - `predicted_Y`: most likely value
+# - `predicted_Y_p`: its probability
+# - `predicted_Y_reported`: the value actually in the data
+# - `predicted_Y_p_reported`: the probability the model gives the reported value
+# - `predicted_Y_role`: target, holdout, development or outside window
+# - `predicted_Y_differs`: True when predicted and reported are different
+#
+# Differences in `development` and `holdout` are in sample and only a
+# diagnostic. Use them as a reference for what is normal, and see if
+# `target` is higher.
+
+# %%
+state["predicted"].head()
+
+# %%
+# Share of differences per role
+# pred = state["predicted"]
+# pred[pred["predicted_Y_reported"].notna()].groupby("predicted_Y_role")[
+#     "predicted_Y_differs"].agg(["size", "mean"])
+
+# %% [markdown]
+# Predictions on the unfiltered data from step 1. Rows filtered out in
+# step 2, or missing time or id, get empty values.
+
+# %%
+# df_with_pred = attach_predictions(state["raw"], state["result"])
+
+# %% [markdown]
+# ### Saving
+#
+# Set `save_dir` under Advanced settings in step 4. Flagged rows, predicted
+# Y, calibration, bootstrap and the settings are then written to files with
+# the target period in the name. The run can then be repeated without anyone
+# watching the screen.
