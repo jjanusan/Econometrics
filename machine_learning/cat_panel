@@ -1,0 +1,2617 @@
+"""
+catpanel: tools for a categorical target in panel data
+======================================================
+
+Four steps that run top to bottom in a notebook. All steps share one state dict.
+
+    from catpanel import (step_load, step_explore, step_select,
+                          step_diagnostics, step_model)
+
+    state = step_load(".")      # 1: browse, pick files, load
+    step_explore(state)         # 1b: look at one column, sum by groups
+    step_select(state)          # 2: pick Y and X, filter rows on X values
+    step_diagnostics(state)     # 3: distribution checks per group
+    step_model(state)           # 4: multinomial logit, checks, imputation, bootstrap
+
+Step 1 can also take a data frame directly: step_load(df=my_df).
+
+Paths in step 1:
+    "gs://bucket/folder"   Google Cloud Storage, read with gcsfs
+    "gs://"                list buckets in GCS_PROJECT
+    anything else          local folder
+
+On your own PC, log in once with:
+    gcloud auth application-default login
+
+What is in state after use:
+    state["raw"]          data after loading and combining, unfiltered
+    state["filtered"]     data after filtering in step 2
+    state["selection"]    y, x columns and active filters from step 2
+    state["diagnostics"]  summary table from step 3
+    state["aggregate"]    last sum table from step 1b
+    state["result"]       dict from step 4: data, X, model, probs, calibration,
+                          calibration_holdout, summary, bootstrap, flagged,
+                          imputation, predictions, settings
+    state["predicted"]    filtered data with predicted Y per row
+
+Filtering in step 2: only the chosen values (or range) in an X column decide
+which rows are kept. Rows with an empty value in that column are kept.
+Y is never filtered. No recoding happens in step 2. Dummy coding and
+log transforms happen in step 4.
+
+Step 4 without widgets:
+    from catpanel import fit_multinomial, attach_predictions, DEFAULT_SETTINGS
+    s = dict(DEFAULT_SETTINGS, y_col="Salary_Group", x_numeric=["Age"],
+             x_categorical=["Gender"], id_col="City", date_col="Date",
+             year_col="Year", target_year=2025, train_from_year=2015,
+             train_to_year=2024)
+    result = fit_multinomial(df, s)
+    df_out = attach_predictions(df, result)
+"""
+
+import os
+import traceback
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from scipy import stats
+from joblib import Parallel, delayed
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+
+# Set to your Google Cloud project id if listing buckets with "gs://" fails.
+GCS_PROJECT = None
+
+
+# ---- Small helpers ----------------------------------------------------------
+
+def _run_callbacks(state, name):
+    """Runs the update functions that later steps registered."""
+    for f in state["_callbacks"].get(name, {}).values():
+        f()
+
+
+def _is_num(series):
+    dtype = series.dtype
+    return (pd.api.types.is_numeric_dtype(dtype)
+            and not pd.api.types.is_bool_dtype(dtype)
+            and not pd.api.types.is_complex_dtype(dtype)
+            and not isinstance(dtype, pd.CategoricalDtype))
+
+
+def _is_cat(series):
+    dtype = series.dtype
+    return (isinstance(dtype, pd.CategoricalDtype)
+            or pd.api.types.is_bool_dtype(dtype)
+            or pd.api.types.is_object_dtype(dtype)
+            or pd.api.types.is_string_dtype(dtype))
+
+
+def _as_float(series):
+    """Column as float64. Anything that is not a number becomes NaN."""
+    return pd.to_numeric(series, errors="coerce").astype("float64")
+
+
+def _parse_const(text, kind):
+    """Turns the text from a field into the right type for a constant column."""
+    text = text.strip()
+    if text == "":
+        raise ValueError("the value is empty")
+    if kind == "integer":
+        return int(text)
+    if kind == "decimal":
+        return float(text.replace(",", "."))
+    if kind == "date":
+        return pd.Timestamp(text)
+    return text
+
+
+# ---- Reading: local folder or Google Cloud Storage --------------------------
+
+_gcs = None
+
+
+def get_gcs():
+    """Creates the gcsfs file system the first time it is needed."""
+    global _gcs
+    if _gcs is None:
+        import gcsfs
+        kwargs = {"token": "google_default"}
+        if GCS_PROJECT:
+            kwargs["project"] = GCS_PROJECT
+        _gcs = gcsfs.GCSFileSystem(**kwargs)
+    return _gcs
+
+
+def is_gcs(path):
+    """True for gs:// paths, False for local paths."""
+    return str(path).startswith("gs://")
+
+
+def _strip_gs(path):
+    return str(path)[len("gs://"):]
+
+
+def list_dir(path):
+    """
+    Lists content as [{"name":..., "path":..., "is_dir": True/False}],
+    folders first. "gs://" lists the buckets you have access to.
+    """
+    out = []
+    if is_gcs(path):
+        for item in get_gcs().ls(_strip_gs(path), detail=True):
+            name = item["name"].rstrip("/")
+            out.append({
+                "name": name.split("/")[-1],
+                "path": "gs://" + name,
+                "is_dir": item["type"] == "directory",
+            })
+    else:
+        for name in os.listdir(path):
+            if name.startswith("."):
+                continue
+            full = os.path.join(path, name)
+            out.append({"name": name, "path": full, "is_dir": os.path.isdir(full)})
+    return sorted(out, key=lambda e: (not e["is_dir"], e["name"]))
+
+
+def read_table(path):
+    """Reads parquet or csv from a local folder or from GCS."""
+    if is_gcs(path):
+        fs = get_gcs()
+        if path.endswith(".parquet"):
+            with fs.open(path, "rb") as f:
+                return pd.read_parquet(f)
+        if path.endswith(".csv"):
+            with fs.open(path, "r") as f:
+                return pd.read_csv(f)
+    else:
+        if path.endswith(".parquet"):
+            return pd.read_parquet(path)
+        if path.endswith(".csv"):
+            return pd.read_csv(path)
+    raise ValueError(f"Only .parquet and .csv are supported, got: {path}")
+
+
+def combine_frames(frames, method="concat", key=None):
+    """Stacks rows (concat) or joins on a shared column (merge)."""
+    if len(frames) == 1:
+        return frames[0].copy()
+    if method == "concat":
+        return pd.concat(frames, ignore_index=True)
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.merge(f, on=key, how="inner")
+    return out
+
+
+# ---- Step 1: load ------------------------------------------------------------
+
+def step_load(start_path=".", df=None):
+    """
+    Step 1: file browser. Click through folders, pick one or more files
+    (.parquet / .csv), combine and load.
+
+    start_path: local folder, or "gs://bucket/folder" for Google Cloud Storage.
+                "gs://" lists your buckets.
+    df:         skip the browser and use this data frame directly.
+
+    Constant column per file: type a column name and pick a type. Each picked
+    file gets its own value field. The value is put on every row of that file
+    before the files are combined. A file without a value gets an empty value.
+    Empty column name means no constant column.
+
+    Returns state, which the other steps take as input.
+    """
+    state = {
+        "path": start_path, "selected_files": [], "raw_list": [], "raw_paths": [],
+        "raw": None, "filtered": None, "selection": None, "diagnostics": None,
+        "result": None, "predicted": None, "aggregate": None,
+        "x_values": {}, "x_ranges": {},
+        "const_values": {},
+        "_callbacks": {"raw": {}, "filtered": {}},
+        "widgets": {},
+    }
+
+    w90 = {"description_width": "90px"}
+    const_name = widgets.Text(value="", placeholder="empty = no constant column",
+                              description="Const column:", style=w90,
+                              layout=widgets.Layout(width="300px"))
+    const_kind = widgets.Dropdown(options=["integer", "decimal", "text", "date"],
+                                  value="integer", description="Type:", style=w90,
+                                  layout=widgets.Layout(width="300px"))
+
+    # Data frame given directly: one data frame, one value.
+    if df is not None:
+        state["raw"] = df.copy()
+        print(f"Data frame given directly: {df.shape[0]} rows, {df.shape[1]} columns")
+        const_value = widgets.Text(value="", placeholder="e.g. 2025 or 2025-01-01",
+                                   description="Value:", style=w90,
+                                   layout=widgets.Layout(width="300px"))
+        add_btn = widgets.Button(description="Add column", button_style="success",
+                                 layout=widgets.Layout(width="200px"))
+        add_out = widgets.Output()
+
+        def add_column(b):
+            changed = False
+            with add_out:
+                clear_output()
+                name = const_name.value.strip()
+                if not name:
+                    print("Type a column name.")
+                    return
+                try:
+                    value = _parse_const(const_value.value, const_kind.value)
+                except ValueError as e:
+                    print(f"Could not read the value as {const_kind.value}: {e}")
+                    return
+                if name in state["raw"].columns:
+                    print(f"WARNING: {name} already exists and is overwritten.")
+                state["raw"][name] = value
+                state["filtered"] = None
+                state["selection"] = None
+                print(f"{name} = {value!r} added to all {len(state['raw'])} rows.")
+                print("Choices in step 2 are reset. Pick Y and X again.")
+                changed = True
+            if changed:
+                _run_callbacks(state, "raw")
+
+        add_btn.on_click(add_column)
+        display(widgets.VBox([
+            widgets.HTML("<b>Constant column (optional)</b>"),
+            const_name, const_kind, const_value, add_btn, add_out,
+        ]))
+        return state
+
+    path_label = widgets.Label(value=str(start_path))
+    up_btn = widgets.Button(description="Up", button_style="warning",
+                            layout=widgets.Layout(width="100px"))
+    status_label = widgets.Label(value="")
+    browser_out = widgets.Output()
+    picked_out = widgets.Output()
+    method_menu = widgets.Dropdown(
+        options=[("Stack rows (concat)", "concat"),
+                 ("Join on shared column (merge)", "merge")],
+        value="concat", description="Combine:",
+        style=w90, layout=widgets.Layout(width="360px"))
+    key_menu = widgets.Dropdown(
+        options=[("(pick key)", None)], value=None, description="Key:",
+        disabled=True, style=w90, layout=widgets.Layout(width="300px"))
+    load_btn = widgets.Button(description="Load picked files", button_style="success",
+                              layout=widgets.Layout(width="200px"))
+    load_out = widgets.Output()
+
+    def make_click(item):
+        def click(b):
+            if item["is_dir"]:
+                state["path"] = item["path"]
+                refresh_browser()
+            else:
+                if item["path"] not in state["selected_files"]:
+                    state["selected_files"].append(item["path"])
+                refresh_picked()
+                status_label.value = f"Picked: {item['name']}"
+        return click
+
+    def refresh_browser():
+        path_label.value = str(state["path"])
+        with browser_out:
+            clear_output(wait=True)
+            try:
+                content = list_dir(state["path"])
+                status_label.value = ""
+            except Exception as e:
+                status_label.value = f"Could not list {state['path']}: {e}"
+                content = []
+            buttons = []
+            for item in content:
+                btn = widgets.Button(
+                    description=("/ " if item["is_dir"] else "* ") + item["name"],
+                    button_style="info" if item["is_dir"] else "",
+                    layout=widgets.Layout(width="100%"))
+                btn.on_click(make_click(item))
+                buttons.append(btn)
+            display(widgets.VBox(buttons) if buttons else widgets.Label("(empty folder)"))
+
+    def make_remove_btn(file_path):
+        btn = widgets.Button(description="X", button_style="danger",
+                             layout=widgets.Layout(width="40px"))
+
+        def remove(b):
+            state["selected_files"].remove(file_path)
+            state["const_values"].pop(file_path, None)
+            refresh_picked()
+        btn.on_click(remove)
+        return btn
+
+    def make_value_field(file_path):
+        field = widgets.Text(value=state["const_values"].get(file_path, ""),
+                             placeholder="constant value",
+                             layout=widgets.Layout(width="160px"))
+
+        def changed(change):
+            state["const_values"][file_path] = change["new"]
+        field.observe(changed, names="value")
+        return field
+
+    def refresh_picked():
+        with picked_out:
+            clear_output(wait=True)
+            if not state["selected_files"]:
+                display(widgets.Label("No files picked"))
+                return
+            rows = [widgets.HBox([widgets.Label(value=f,
+                                                layout=widgets.Layout(flex="1")),
+                                  make_value_field(f),
+                                  make_remove_btn(f)])
+                    for f in state["selected_files"]]
+            display(widgets.VBox(
+                [widgets.Label("Picked files (the field on the right is the "
+                               "constant column value for that file):")] + rows))
+
+    def go_up(b):
+        if is_gcs(state["path"]):
+            rest = _strip_gs(state["path"]).rstrip("/")
+            state["path"] = "gs://" + (rest.rsplit("/", 1)[0] if "/" in rest else "")
+        else:
+            state["path"] = os.path.dirname(os.path.abspath(str(state["path"])))
+        refresh_browser()
+
+    def load(b):
+        loaded = False
+        with load_out:
+            clear_output()
+            if not state["selected_files"]:
+                print("Pick at least one file first.")
+                return
+            if state["raw_list"] and state["raw_paths"] == list(state["selected_files"]):
+                frames = state["raw_list"]
+            else:
+                frames = []
+                for path in state["selected_files"]:
+                    try:
+                        f = read_table(path)
+                    except Exception as e:
+                        print(f"Error reading {path}: {e}")
+                        return
+                    print(f"{path}: {f.shape[0]} rows, {f.shape[1]} columns")
+                    frames.append(f)
+                state["raw_list"] = frames
+                state["raw_paths"] = list(state["selected_files"])
+
+            # Constant column per file. Added to copies, so the raw data stay unchanged.
+            name = const_name.value.strip()
+            has_values = any(state["const_values"].get(p, "").strip()
+                             for p in state["selected_files"])
+            if not name and has_values:
+                print("NOTE: values are filled in, but the column name is empty. "
+                      "No constant column added.")
+            if name:
+                empty = pd.NaT if const_kind.value == "date" else np.nan
+                with_const = []
+                for path, f in zip(state["selected_files"], frames):
+                    f = f.copy()
+                    text = state["const_values"].get(path, "").strip()
+                    if name in f.columns:
+                        print(f"WARNING: {name} already exists in {path} and is overwritten.")
+                    if text == "":
+                        f[name] = empty
+                        print(f"NOTE: {path} has no value, {name} will be empty.")
+                    else:
+                        try:
+                            value = _parse_const(text, const_kind.value)
+                        except ValueError as e:
+                            print(f"Could not read '{text}' as {const_kind.value} "
+                                  f"for {path}: {e}")
+                            return
+                        f[name] = value
+                        print(f"{path}: {name} = {value!r}")
+                    with_const.append(f)
+                frames = with_const
+
+            shared = set(frames[0].columns)
+            for f in frames[1:]:
+                shared &= set(f.columns)
+            shared = sorted(shared)
+            old = key_menu.value
+            key_menu.options = [("(pick key)", None)] + [(c, c) for c in shared]
+            key_menu.value = old if old in shared else None
+            key_menu.disabled = len(frames) < 2
+            if len(frames) > 1:
+                print(f"Shared columns: {shared}")
+
+            if method_menu.value == "merge" and len(frames) > 1:
+                if key_menu.value is None:
+                    print("Pick a key for merge and press 'Load picked files' again.")
+                    return
+                if name and name != key_menu.value:
+                    print(f"NOTE: {name} is in every file and is not the key. "
+                          f"Merge then gives several columns ({name}_x, {name}_y). "
+                          "Use concat if the files are different periods.")
+                state["raw"] = combine_frames(frames, "merge", key_menu.value)
+            else:
+                state["raw"] = combine_frames(frames, "concat")
+            state["filtered"] = None
+            state["selection"] = None
+            print(f"Combined data: {state['raw'].shape[0]} rows, "
+                  f"{state['raw'].shape[1]} columns")
+            if name and name in state["raw"].columns:
+                print(f"Rows per value of {name}:")
+                print(state["raw"][name].value_counts(dropna=False).sort_index()
+                      .to_string())
+            print("Go on to step 2.")
+            loaded = True
+        if loaded:
+            _run_callbacks(state, "raw")
+
+    step1 = widgets.VBox([
+        widgets.HTML("<b>Step 1: browse and pick files (.parquet / .csv)</b>"),
+        widgets.HBox([up_btn, path_label, status_label]),
+        browser_out,
+        widgets.HTML("<hr>"),
+        widgets.HBox([const_name, const_kind]),
+        widgets.HTML("<small>Constant column: type name and type here, and one "
+                     "value per file in the list below. The value is added when "
+                     "you press 'Load picked files'. If you change a value, press "
+                     "the button again.</small>"),
+        picked_out,
+        widgets.HBox([method_menu, key_menu]),
+        load_btn,
+        load_out,
+    ])
+    up_btn.on_click(go_up)
+    load_btn.on_click(load)
+
+    state["widgets"]["load"] = {
+        "method": method_menu, "key": key_menu, "load": load_btn,
+        "up": up_btn, "const_name": const_name, "const_kind": const_kind,
+    }
+    refresh_browser()
+    refresh_picked()
+    display(step1)
+    return state
+
+
+# ---- Step 1b: column overview and sums ---------------------------------------
+
+def _describe_numeric(x):
+    """Descriptive statistics for a numeric column, as one row."""
+    x_clean = x.dropna()
+    if x_clean.empty:
+        return pd.DataFrame([{"N": 0, "Missing": int(x.isna().sum())}])
+    q1, q3 = x_clean.quantile([0.25, 0.75])
+    row = {
+        "N": len(x_clean),
+        "Missing": int(x.isna().sum()),
+        "Mean": x_clean.mean(),
+        "SD": x_clean.std(),
+        "Median": x_clean.median(),
+        "Q1": q1,
+        "Q3": q3,
+        "Min": x_clean.min(),
+        "Max": x_clean.max(),
+        "IQR": q3 - q1,
+        "Skewness": x_clean.skew(),
+        "Unique values": x_clean.nunique(),
+    }
+    return pd.DataFrame([row])
+
+
+def _describe_numeric_by_group(df, column, group, max_groups=200):
+    """Descriptive statistics for a numeric column, one row per value of group."""
+    n = df[group].nunique(dropna=False)
+    if n > max_groups:
+        raise ValueError(f"{group} has {n} values, the limit is {max_groups}. "
+                         "Pick a grouping column with fewer values.")
+    parts = []
+    for value, g in df.groupby(group, dropna=False, observed=True, sort=False):
+        row = _describe_numeric(g[column])
+        row.insert(0, group, value)
+        parts.append(row)
+    out = pd.concat(parts, ignore_index=True)
+    try:
+        out = out.sort_values(group, na_position="last", ignore_index=True)
+    except TypeError:
+        pass
+    return out
+
+
+def _describe_categorical(x, max_rows=50):
+    """Frequency table for a categorical column."""
+    freq = (x.value_counts(dropna=False)
+            .rename_axis("Category")
+            .reset_index(name="N"))
+    freq["Percent"] = (freq["N"] / len(x) * 100).round(1)
+    if len(freq) > max_rows:
+        rest = freq.iloc[max_rows:]
+        freq = freq.iloc[:max_rows].copy()
+        freq.loc[len(freq)] = [f"(+{len(rest)} more levels)",
+                               int(rest["N"].sum()),
+                               round(rest["Percent"].sum(), 1)]
+    return freq
+
+
+def _describe_datetime(x):
+    """Summary for a date column: span, days, years and months."""
+    x_clean = x.dropna()
+    if x_clean.empty:
+        return pd.DataFrame([{"N": 0, "Missing": int(x.isna().sum())}])
+    return pd.DataFrame([{
+        "N": len(x_clean),
+        "Missing": int(x.isna().sum()),
+        "Min": x_clean.min(),
+        "Max": x_clean.max(),
+        "Span (days)": (x_clean.max() - x_clean.min()).days,
+        "Unique dates": x_clean.nunique(),
+        "Unique years": x_clean.dt.year.nunique(),
+        "Unique months": x_clean.dt.to_period("M").nunique(),
+    }])
+
+
+def inspect_column(df, column):
+    """Prints type, count and missing, and returns a summary table."""
+    x = df[column]
+    print(f"\nColumn: {column}")
+    print(f"Type: {x.dtype}")
+    print(f"Observations: {len(x)}")
+    print(f"Missing: {int(x.isna().sum())} ({100 * x.isna().mean():.1f} percent)")
+    if pd.api.types.is_datetime64_any_dtype(x):
+        return _describe_datetime(x)
+    if pd.api.types.is_numeric_dtype(x) and not pd.api.types.is_bool_dtype(x):
+        return _describe_numeric(x)
+    print(f"Unique values: {x.nunique(dropna=True)}")
+    return _describe_categorical(x)
+
+
+def browse_columns(df):
+    """Column browser with a dropdown. Takes a data frame directly."""
+    dropdown = widgets.Dropdown(
+        options=df.columns.tolist(),
+        description="Column:",
+        style={"description_width": "initial"},
+    )
+    output = widgets.Output()
+
+    def on_change(change):
+        if change["type"] == "change" and change["name"] == "value":
+            with output:
+                clear_output(wait=True)
+                display(inspect_column(df, change["new"]))
+
+    dropdown.observe(on_change, names="value")
+    display(dropdown, output)
+    with output:
+        display(inspect_column(df, dropdown.value))
+    return dropdown, output
+
+
+def sum_by(df, column, value_col, time_col=None, where_col=None, where_value=None,
+           max_rows=500):
+    """
+    Sum of value_col per value of column, optionally split by time_col.
+    Same as in SQL:
+        SELECT column, time_col, SUM(value_col) FROM df
+        WHERE where_col = where_value
+        GROUP BY column, time_col
+    Empty values in value_col are skipped. A cell with no numbers becomes NaN.
+    Returns (table, rows used).
+    """
+    if value_col == column:
+        raise ValueError("Pick a different column to sum than the column itself.")
+    if time_col is not None and time_col in (column, value_col):
+        raise ValueError("The time column must differ from column and value column.")
+    d = df
+    if where_col is not None:
+        d = d[d[where_col] == where_value]
+        if d.empty:
+            raise ValueError(f"No rows where {where_col} = {where_value!r}.")
+    n = d[column].nunique(dropna=False)
+    if n > max_rows:
+        raise ValueError(f"{column} has {n} values, the limit is {max_rows}. "
+                         "Pick a column with fewer values or narrow with WHERE.")
+    keys = [column] if time_col is None else [column, time_col]
+    small = d[keys].copy()
+    small["_sum"] = _as_float(d[value_col])
+    g = small.groupby(keys, dropna=False, observed=True)["_sum"].sum(min_count=1)
+    if time_col is None:
+        table = g.to_frame(f"sum_{value_col}")
+    else:
+        table = g.unstack(time_col)
+        table.columns = table.columns.astype(object)
+        table["Total"] = table.sum(axis=1, min_count=1)
+    table.index = table.index.astype(object)
+    table.loc["Total"] = table.sum(min_count=1)
+    return table, len(d)
+
+
+def step_explore(state):
+    """
+    Step 1b: look at one column at a time, and sum a numeric column per
+    value of that column.
+
+    Column:    the column you look at and group by.
+    Sum:       numeric column summed per value of Column.
+    Split by:  time column (for example the constant column from step 1).
+               Gives one table column per time value.
+    WHERE:     limit rows to those where a column has a given value.
+
+    Does not change the data. The filter here only applies to step 1b.
+    The last table is stored in state["aggregate"].
+    """
+    w = {"description_width": "90px"}
+    wide = widgets.Layout(width="330px")
+    column_menu = widgets.Dropdown(options=[], description="Column:",
+                                   style=w, layout=wide)
+    sum_menu = widgets.Dropdown(options=[("(none)", None)], value=None,
+                                description="Sum:", style=w, layout=wide)
+    time_menu = widgets.Dropdown(options=[("(none)", None)], value=None,
+                                 description="Split by:", style=w, layout=wide)
+    where_col = widgets.Dropdown(options=[("(none)", None)], value=None,
+                                 description="WHERE:", style=w, layout=wide)
+    where_value = widgets.Dropdown(options=[("(pick column)", None)], value=None,
+                                   description="=", disabled=True,
+                                   style=w, layout=wide)
+    output = widgets.Output()
+    ui = {"loading": False, "first": True}
+
+    def show():
+        with output:
+            clear_output(wait=True)
+            if state["raw"] is None:
+                print("Load data first (step 1).")
+                return
+            name = column_menu.value
+            if name is None:
+                print("Pick a column.")
+                return
+            d = state["raw"]
+            if where_col.value is not None:
+                if where_value.value is None:
+                    print(f"WHERE {where_col.value}: no value picked, filter not used.")
+                else:
+                    d = d[d[where_col.value] == where_value.value]
+                    print(f"WHERE {where_col.value} = {where_value.value!r}: "
+                          f"{len(d)} of {len(state['raw'])} rows.")
+            if d.empty:
+                print("No rows left after the filter.")
+                return
+            display(inspect_column(d, name))
+            if sum_menu.value is None:
+                return
+            text = f"\nSum of {sum_menu.value} per {name}"
+            if time_menu.value is not None:
+                text += f", split by {time_menu.value}"
+            print(text + ":")
+            try:
+                table, n = sum_by(d, name, sum_menu.value, time_col=time_menu.value)
+            except ValueError as e:
+                print(f"Stopped: {e}")
+                return
+            state["aggregate"] = table
+            display(table.round(0).astype("Int64"))
+            print("NaN means the cell has no rows, or only empty values in "
+                  f"{sum_menu.value}.")
+
+    def fill_where_values():
+        col = where_col.value
+        ui["loading"] = True
+        try:
+            if col is None or state["raw"] is None:
+                where_value.options = [("(pick column)", None)]
+                where_value.value = None
+                where_value.disabled = True
+            else:
+                series = state["raw"][col].dropna().drop_duplicates()
+                if len(series) > 1000:
+                    where_value.options = [(f"(too many values: {len(series)})", None)]
+                    where_value.value = None
+                    where_value.disabled = True
+                else:
+                    try:
+                        values = series.sort_values().tolist()
+                    except TypeError:
+                        values = sorted(series.tolist(), key=str)
+                    values = [v.item() if isinstance(v, np.generic) else v
+                              for v in values]
+                    where_value.options = [(str(v), v) for v in values] or [
+                        ("(no values)", None)]
+                    where_value.value = values[0] if values else None
+                    where_value.disabled = not values
+        finally:
+            ui["loading"] = False
+
+    def on_change(change):
+        if not ui["loading"]:
+            show()
+
+    def on_where_col(change):
+        if ui["loading"]:
+            return
+        fill_where_values()
+        show()
+
+    def fill():
+        ui["loading"] = True
+        try:
+            if state["raw"] is None:
+                column_menu.options = []
+                column_menu.value = None
+                for m in (sum_menu, time_menu, where_col):
+                    m.options = [("(none)", None)]
+                    m.value = None
+            else:
+                d = state["raw"]
+                cols = list(d.columns)
+                old = column_menu.value
+                column_menu.options = [(str(c), c) for c in cols]
+                column_menu.value = old if old in cols else (cols[0] if cols else None)
+
+                numeric = [c for c in cols if _is_num(d[c])]
+                old = sum_menu.value
+                sum_menu.options = [("(none)", None)] + [(str(c), c) for c in numeric]
+                sum_menu.value = old if old in numeric else None
+
+                old = time_menu.value
+                time_menu.options = [("(none)", None)] + [(str(c), c) for c in cols]
+                if old in cols:
+                    time_menu.value = old
+                elif ui["first"]:
+                    # Suggestion: constant column from step 1, else a column named year.
+                    const = state["widgets"].get("load", {}).get("const_name")
+                    const = const.value.strip() if const is not None else ""
+                    guess = const if const in cols else next(
+                        (c for c in cols
+                         if str(c).lower() in ("year", "aar", "ar", "\u00e5r")), None)
+                    time_menu.value = guess
+                else:
+                    time_menu.value = None
+
+                old = where_col.value
+                where_col.options = [("(none)", None)] + [(str(c), c) for c in cols]
+                where_col.value = old if old in cols else None
+                ui["first"] = False
+        finally:
+            ui["loading"] = False
+        fill_where_values()
+        show()
+
+    for m in (column_menu, sum_menu, time_menu, where_value):
+        m.observe(on_change, names="value")
+    where_col.observe(on_where_col, names="value")
+    state["_callbacks"]["raw"]["explore"] = fill
+    state["widgets"]["explore"] = {
+        "column": column_menu, "sum": sum_menu, "time": time_menu,
+        "where_col": where_col, "where_value": where_value, "output": output,
+    }
+    display(widgets.VBox([
+        widgets.HTML("<b>Step 1b: column overview and sums</b>"),
+        widgets.HTML("<small>Pick Column to inspect it. Also pick a column under "
+                     "Sum to get the sum per value of Column. Split by gives one "
+                     "table column per time value. WHERE limits the rows, like "
+                     "WHERE in SQL. The data are not changed.</small>"),
+        widgets.HBox([column_menu, sum_menu]),
+        widgets.HBox([time_menu]),
+        widgets.HBox([where_col, where_value]),
+        output,
+    ]))
+    fill()
+
+
+# ---- Step 2: pick columns and filter ------------------------------------------
+
+def step_select(state):
+    """
+    Step 2: pick Y (categorical target), X (predictors) and filter rows on
+    chosen X values.
+
+    Categorical X: tick values in the X values panel. Only rows with a ticked
+    value, or an empty value, are kept. No ticked values means no filter on
+    that column.
+    Numeric X: an active range keeps rows within both limits, plus rows with
+    an empty value. Without an active range all rows are kept.
+    Bool and pandas category are treated as categorical, even with numbers.
+
+    Y is never filtered directly. Y levels can only lose rows because X values
+    were filtered out, and that is shown in the printout.
+
+    No recoding here. Columns go on unchanged; dummy coding and log transforms
+    happen in step 4.
+
+    The button "Apply and filter" puts the filtered data in state["filtered"]
+    and the choices in state["selection"]. If you change anything afterwards,
+    press the button again before step 3 and 4.
+    """
+    w = {"description_width": "110px"}
+    y_menu = widgets.Dropdown(options=[], description="Y (target):", style=w,
+                              layout=widgets.Layout(width="330px"))
+    x_checks = {}
+    x_check_box = widgets.VBox()
+    x_cache, x_ticked, x_visible = {}, {}, {}
+    x_bounds = {}
+    state["x_values"] = {}
+    state["x_ranges"] = {}
+    ui = {"loading": False, "syncing": False, "page": 0}
+    page_size = 100
+
+    x_active = widgets.Dropdown(
+        options=[("(pick X)", None)], disabled=True,
+        description="Column:", style={"description_width": "65px"},
+        layout=widgets.Layout(width="290px"))
+    x_search = widgets.Text(
+        placeholder="Search X values...", disabled=True,
+        layout=widgets.Layout(width="290px"))
+    x_value_box = widgets.VBox(
+        layout=widgets.Layout(width="100%", height="180px",
+                              border="1px solid gray", overflow="auto",
+                              align_items="stretch"))
+    x_all_btn = widgets.Button(description="Select all", disabled=True,
+                               layout=widgets.Layout(width="100px"))
+    x_clear_btn = widgets.Button(description="Clear", disabled=True,
+                                 layout=widgets.Layout(width="100px"))
+    x_status = widgets.Label(value="Pick an X column.")
+    x_prev = widgets.Button(description="Prev", layout=widgets.Layout(width="80px"))
+    x_next = widgets.Button(description="Next", layout=widgets.Layout(width="80px"))
+    x_page = widgets.Label()
+    x_pager = widgets.HBox([x_prev, x_page, x_next],
+                           layout=widgets.Layout(display="none"))
+    x_cat_panel = widgets.VBox([
+        x_search,
+        x_value_box,
+        widgets.HBox([x_all_btn, x_clear_btn]), x_pager,
+        widgets.HTML(
+            "<small>Only rows with ticked values are kept. Nothing ticked "
+            "means no filter. Select all also covers values hidden by the "
+            "search.</small>")
+    ], layout=widgets.Layout(width="290px", display="none"))
+
+    x_use_range = widgets.Checkbox(
+        value=False, description="Use range as filter", indent=False)
+    x_lo = widgets.FloatText(
+        value=0, description="From:", style={"description_width": "38px"},
+        layout=widgets.Layout(width="140px"))
+    x_hi = widgets.FloatText(
+        value=1, description="To:", style={"description_width": "30px"},
+        layout=widgets.Layout(width="140px"))
+    x_slider = widgets.FloatRangeSlider(
+        value=(0, 1), min=0, max=1, step=0.01, readout=False,
+        continuous_update=False, layout=widgets.Layout(width="290px"))
+    x_range_reset = widgets.Button(
+        description="Reset range", layout=widgets.Layout(width="150px"))
+    x_num_panel = widgets.VBox([
+        x_use_range, widgets.HBox([x_lo, x_hi]), x_slider,
+        x_range_reset,
+        widgets.HTML(
+            "<small>Type limits or drag the handles to turn the range on. "
+            "Both limits are included. Rows outside the range are removed, "
+            "rows with an empty value are kept. Untick to keep all rows. "
+            "Write ten thousand as 10000.</small>")
+    ], layout=widgets.Layout(width="290px", display="none"))
+
+    apply_btn = widgets.Button(
+        description="Apply and filter", button_style="info",
+        layout=widgets.Layout(width="290px"))
+    apply_out = widgets.Output()
+
+    def reset_downstream(change=None):
+        if ui["loading"]:
+            return
+        state["filtered"] = None
+        state["selection"] = None
+
+    def get_x_values(name):
+        if name not in x_cache:
+            series = state["raw"][name].dropna().drop_duplicates()
+            try:
+                values = series.sort_values().tolist()
+            except TypeError:
+                values = sorted(series.tolist(),
+                                key=lambda v: (type(v).__name__, str(v).casefold()))
+            values = [v.item() if isinstance(v, np.generic) else v for v in values]
+            x_cache[name] = values
+            x_ticked[name] = set()
+            state["x_values"][name] = []
+        return x_cache[name]
+
+    def save_x_choice(name):
+        state["x_values"][name] = [x_cache[name][i] for i in sorted(x_ticked[name])]
+        reset_downstream()
+
+    def is_num_x(name):
+        return _is_num(state["raw"][name])
+
+    def get_x_range(name):
+        if name not in x_bounds:
+            nums = _as_float(state["raw"][name])
+            nums = nums[np.isfinite(nums)]
+            x_bounds[name] = (None if nums.empty else
+                              (float(nums.min()), float(nums.max())))
+            lo, hi = x_bounds[name] or (0.0, 1.0)
+            state["x_ranges"][name] = {"lo": lo, "hi": hi, "on": False}
+        return state["x_ranges"][name]
+
+    def range_error(r):
+        if not np.isfinite(r["lo"]) or not np.isfinite(r["hi"]):
+            return "From and To must be finite numbers."
+        if r["lo"] > r["hi"]:
+            return "From cannot be larger than To."
+        return None
+
+    def show_x_range(name):
+        r = get_x_range(name)
+        bounds = x_bounds[name]
+        ui["syncing"] = True
+        try:
+            x_use_range.value = r["on"]
+            x_lo.value = round(r["lo"], 2)
+            x_hi.value = round(r["hi"], 2)
+            for ctrl in (x_use_range, x_lo, x_hi, x_range_reset):
+                ctrl.disabled = bounds is None
+            err = range_error(r)
+            x_slider.disabled = bounds is None or err is not None
+            if bounds is not None and err is None:
+                lower = min(bounds[0], r["lo"])
+                upper = max(bounds[1], r["hi"])
+                if lower == upper:
+                    width = max(1.0, abs(lower) * 0.01)
+                    lower, upper = lower - width, upper + width
+                # Widen first to avoid invalid limits when switching X.
+                x_slider.min = min(x_slider.min, lower)
+                x_slider.max = max(x_slider.max, upper)
+                x_slider.value = (r["lo"], r["hi"])
+                x_slider.min, x_slider.max = lower, upper
+                x_slider.step = (1.0 if pd.api.types.is_integer_dtype(
+                    state["raw"][name].dtype) else max((upper - lower) / 1000, 1e-9))
+        finally:
+            ui["syncing"] = False
+
+    def range_changed(change):
+        if ui["loading"] or ui["syncing"]:
+            return
+        name = x_active.value
+        if name is None or not is_num_x(name):
+            return
+        r = get_x_range(name)
+        if change["owner"] is x_use_range:
+            r["on"] = bool(change["new"])
+        else:
+            r["on"] = True
+            if change["owner"] is x_slider:
+                r["lo"], r["hi"] = map(float, change["new"])
+            else:
+                r["lo"], r["hi"] = float(x_lo.value), float(x_hi.value)
+        reset_downstream()
+        show_x_range(name)
+        update_x_status()
+
+    def reset_range(b):
+        name = x_active.value
+        if name is None or not is_num_x(name):
+            return
+        lo, hi = x_bounds[name] or (0.0, 1.0)
+        state["x_ranges"][name] = {"lo": lo, "hi": hi, "on": False}
+        reset_downstream()
+        show_x_range(name)
+        update_x_status()
+
+    def update_x_status():
+        name = x_active.value
+        if name is None:
+            x_status.value = "Pick an X column."
+            x_all_btn.disabled = x_clear_btn.disabled = True
+            return
+        if is_num_x(name):
+            x_all_btn.disabled = x_clear_btn.disabled = True
+            r = get_x_range(name)
+            if x_bounds[name] is None:
+                x_status.value = "No finite numbers in the column."
+            elif not r["on"]:
+                x_status.value = "No filter: all rows kept."
+            elif range_error(r):
+                x_status.value = range_error(r)
+            else:
+                nums = _as_float(state["raw"][name])
+                known = np.isfinite(nums)
+                hits = nums.between(r["lo"], r["hi"], inclusive="both") & known
+                empty = int(state["raw"][name].isna().sum())
+                x_status.value = (f"Keeps {int(hits.sum())} of {int(known.sum())} "
+                                  f"known, plus {empty} empty.")
+            return
+        values = get_x_values(name)
+        text = x_search.value.casefold().strip()
+        hits = sum(text in str(v).casefold() for v in values)
+        n = len(x_ticked[name])
+        if n == 0:
+            x_status.value = f"No filter: all rows kept. {hits} search hits."
+        else:
+            x_status.value = f"{n} of {len(values)} values ticked; {hits} search hits."
+        x_all_btn.disabled = not values
+        x_clear_btn.disabled = not n
+
+    def show_x_values():
+        for box in x_visible.values():
+            box.close()
+        x_visible.clear()
+        name = x_active.value
+        numeric = name is not None and is_num_x(name)
+        x_cat_panel.layout.display = "flex" if name is not None and not numeric else "none"
+        x_num_panel.layout.display = "flex" if numeric else "none"
+        x_search.disabled = name is None or numeric
+        if name is None:
+            x_value_box.children = [widgets.Label("Pick an X column.")]
+            x_pager.layout.display = "none"
+            update_x_status()
+            return
+        if numeric:
+            x_value_box.children = []
+            show_x_range(name)
+            update_x_status()
+            return
+        values = get_x_values(name)
+        text = x_search.value.casefold().strip()
+        hits = [i for i, v in enumerate(values) if text in str(v).casefold()]
+        pages = max(1, (len(hits) + page_size - 1) // page_size)
+        ui["page"] = min(ui["page"], pages - 1)
+        start = ui["page"] * page_size
+        for i in hits[start:start + page_size]:
+            box = widgets.Checkbox(
+                value=i in x_ticked[name], description=str(values[i]),
+                indent=False, layout=widgets.Layout(width="auto"))
+
+            def ticked(change, col=name, idx=i):
+                if change["new"]:
+                    x_ticked[col].add(idx)
+                else:
+                    x_ticked[col].discard(idx)
+                save_x_choice(col)
+                update_x_status()
+
+            box.observe(ticked, names="value")
+            x_visible[i] = box
+        x_value_box.children = list(x_visible.values()) or [
+            widgets.Label("No hits." if values else "No values.")]
+        x_page.value = f"{ui['page'] + 1} / {pages}"
+        x_prev.disabled = ui["page"] == 0
+        x_next.disabled = ui["page"] == pages - 1
+        x_pager.layout.display = "flex" if pages > 1 else "none"
+        update_x_status()
+
+    def switch_x(change=None):
+        if ui["loading"]:
+            return
+        ui["page"] = 0
+        ui["syncing"] = True
+        try:
+            x_search.value = ""
+        finally:
+            ui["syncing"] = False
+        show_x_values()
+
+    def search_x(change):
+        if ui["loading"] or ui["syncing"]:
+            return
+        ui["page"] = 0
+        show_x_values()
+
+    def move_page(step):
+        ui["page"] = max(0, ui["page"] + step)
+        show_x_values()
+
+    def select_all_x(b):
+        name = x_active.value
+        if name is not None and not is_num_x(name):
+            # All values, also those hidden by search or paging.
+            x_ticked[name] = set(range(len(get_x_values(name))))
+            save_x_choice(name)
+            show_x_values()
+
+    def clear_x(b):
+        name = x_active.value
+        if name is not None and not is_num_x(name):
+            x_ticked[name].clear()
+            save_x_choice(name)
+            show_x_values()
+
+    def update_x_list(change=None, col=None):
+        if ui["loading"]:
+            return
+        chosen = [n for n, b in x_checks.items() if b.value and n != y_menu.value]
+        old = x_active.value
+        preferred = col if change and change["new"] else old
+        x_active.options = [(str(n), n) for n in chosen] or [("(pick X)", None)]
+        x_active.value = (preferred if preferred in chosen
+                          else chosen[0] if chosen else None)
+        x_active.disabled = not chosen
+        switch_x()
+        reset_downstream()
+
+    def y_changed(change=None):
+        if ui["loading"]:
+            return
+        for name, box in x_checks.items():
+            box.disabled = name == y_menu.value
+            if box.disabled:
+                box.value = False
+        update_x_list()
+
+    def fill_menus():
+        ui["loading"] = True
+        try:
+            cols = list(state["raw"].columns)
+            y_menu.options = cols
+            for box in x_checks.values():
+                box.close()
+            x_checks.clear()
+            x_cache.clear()
+            x_ticked.clear()
+            x_bounds.clear()
+            state["x_values"].clear()
+            state["x_ranges"].clear()
+            for name in cols:
+                box = widgets.Checkbox(
+                    value=False, description=str(name), indent=False,
+                    disabled=name == y_menu.value,
+                    layout=widgets.Layout(width="auto"))
+                box.observe(lambda change, n=name: update_x_list(change, n),
+                            names="value")
+                x_checks[name] = box
+            x_check_box.children = list(x_checks.values())
+        finally:
+            ui["loading"] = False
+        update_x_list()
+
+    def build_filter(d, xs):
+        """
+        Returns (mask, descriptions). mask is True for rows that are kept.
+        Empty values in a filtered column are always kept.
+        """
+        mask = pd.Series(True, index=d.index)
+        descriptions = []
+        for x in xs:
+            if is_num_x(x):
+                r = state["x_ranges"].get(x)
+                if not r or not r["on"]:
+                    continue
+                err = range_error(r)
+                if err:
+                    raise ValueError(f"{x}: {err}")
+                nums = _as_float(d[x])
+                keep = nums.between(r["lo"], r["hi"], inclusive="both") | d[x].isna()
+                text = f"{x}: range [{r['lo']:.15g}, {r['hi']:.15g}]"
+            else:
+                values = state["x_values"].get(x, [])
+                if not values:
+                    continue
+                keep = d[x].isin(values) | d[x].isna()
+                text = f"{x}: values {values}"
+            descriptions.append(f"{text}, removes {int((~keep).sum())} rows")
+            mask &= keep
+        return mask, descriptions
+
+    def apply_filter(b):
+        ready = False
+        with apply_out:
+            clear_output()
+            reset_downstream()
+            if state["raw"] is None:
+                print("Load data first (step 1).")
+                return
+            y = y_menu.value
+            xs = [n for n, box in x_checks.items() if box.value and n != y]
+            if y is None:
+                print("Pick Y.")
+                return
+            if not xs:
+                print("Pick at least one X.")
+                return
+            try:
+                mask, filters = build_filter(state["raw"], xs)
+            except ValueError as e:
+                print(f"Filter error: {e}")
+                return
+            d = state["raw"][mask].copy()
+            state["filtered"] = d
+            state["selection"] = {
+                "y": y, "xs": xs, "filters": filters,
+                "rows_before": int(len(state["raw"])), "rows_after": int(len(d)),
+            }
+            print(f"Y: {y}")
+            print(f"X: {xs}")
+            if filters:
+                print("Active filters:")
+                for f in filters:
+                    print(f"  {f}")
+            else:
+                print("No active filters. All rows kept.")
+            print(f"Rows: {len(state['raw'])} before, {len(d)} after filtering.")
+            before = state["raw"][y].value_counts(dropna=False)
+            after = d[y].value_counts(dropna=False)
+            table = pd.DataFrame({"before": before, "after": after}).fillna(0).astype(int)
+            table = table[table["before"] > 0]
+            table["removed"] = table["before"] - table["after"]
+            print("\nRows per Y level before and after filtering (Y itself is "
+                  "not filtered, only through X):")
+            print(table.to_string())
+            print("\nGo on to step 3 or 4.")
+            ready = True
+        if ready:
+            _run_callbacks(state, "filtered")
+
+    step2 = widgets.VBox([
+        widgets.HTML("<b>Step 2: pick Y, X and filter rows</b>"),
+        widgets.HBox([
+            widgets.VBox([y_menu], layout=widgets.Layout(margin="0 20px 0 0")),
+            widgets.VBox([
+                widgets.HTML("<b>X columns</b>"),
+                widgets.Box([x_check_box], layout=widgets.Layout(
+                    border="1px solid gray", height="250px", width="250px",
+                    overflow="auto"))
+            ], layout=widgets.Layout(margin="0 20px 0 0")),
+            widgets.VBox([
+                widgets.HTML("<b>X values (filter)</b>"),
+                x_active, x_cat_panel, x_num_panel, x_status
+            ])
+        ], layout=widgets.Layout(flex_flow="row wrap", align_items="flex-start")),
+        widgets.HTML(
+            "Y should be categorical. Y is never filtered; only chosen X values "
+            "decide which rows are kept. Rows with an empty value in a filtered "
+            "column are kept. No recoding happens here."),
+        apply_btn, apply_out,
+    ])
+
+    apply_btn.on_click(apply_filter)
+    y_menu.observe(y_changed, names="value")
+    x_active.observe(switch_x, names="value")
+    x_search.observe(search_x, names="value")
+    x_all_btn.on_click(select_all_x)
+    x_clear_btn.on_click(clear_x)
+    for ctrl in (x_use_range, x_lo, x_hi, x_slider):
+        ctrl.observe(range_changed, names="value")
+    x_range_reset.on_click(reset_range)
+    x_prev.on_click(lambda b: move_page(-1))
+    x_next.on_click(lambda b: move_page(1))
+
+    state["widgets"]["select"] = {
+        "y": y_menu, "x": x_check_box, "x_checks": x_checks,
+        "x_active": x_active, "x_search": x_search, "x_all": x_all_btn,
+        "x_clear": x_clear_btn, "x_value_boxes": x_visible,
+        "x_status": x_status, "x_prev": x_prev, "x_next": x_next,
+        "x_use_range": x_use_range, "x_lo": x_lo, "x_hi": x_hi,
+        "x_slider": x_slider, "x_range_reset": x_range_reset,
+        "apply": apply_btn, "apply_out": apply_out,
+    }
+
+    state["_callbacks"]["raw"]["select"] = fill_menus
+    if state["raw"] is not None:
+        fill_menus()
+    else:
+        y_menu.options = []
+    display(step2)
+
+
+# ---- Step 3: distribution checks ----------------------------------------------
+
+def group_distribution_check(df, group_a, group_b, value_col, max_groups=25, dpi=100):
+    """
+    Distribution and normality checks for value_col per group_a x group_b.
+
+    Shows two figures in the notebook: a grid with histogram+KDE, boxplot and
+    Q-Q plot per group, and one overview boxplot coloured by group_b.
+    Prints descriptive statistics and Shapiro-Wilk per group.
+    Stops with ValueError if the number of groups is above max_groups.
+
+    Returns summary (pd.DataFrame).
+    """
+    d = df[[group_a, group_b, value_col]].copy()
+    d[value_col] = _as_float(d[value_col])
+
+    groups = [(k, g) for k, g in d.groupby([group_a, group_b], observed=True)
+              if g[value_col].notna().any()]
+    n_groups = len(groups)
+    if n_groups == 0:
+        raise ValueError(f"No groups with values in {value_col}.")
+    if n_groups > max_groups:
+        raise ValueError(
+            f"{n_groups} groups ({group_a} x {group_b}), the limit is "
+            f"{max_groups}. Filter in step 2 or pick a categorical column "
+            "with fewer levels.")
+
+    # Descriptive statistics and normality test per group
+    desc = d.groupby([group_a, group_b], observed=True)[value_col].agg(
+        n="count", mean="mean", std="std", skew="skew",
+        kurtosis=lambda x: x.kurt()
+    ).round(2)
+
+    rows = []
+    for (g1, g2), g in groups:
+        vals = g[value_col].dropna().to_numpy()
+        if len(vals) >= 3 and np.std(vals) > 0:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                W, p = stats.shapiro(vals)
+        else:
+            W, p = np.nan, np.nan
+        rows.append({group_a: g1, group_b: g2, "shapiro_W": W, "shapiro_p": p})
+    shapiro_results = pd.DataFrame(rows).set_index([group_a, group_b])
+    summary = desc.join(shapiro_results, how="inner")
+    summary["normal_at_5pct"] = summary["shapiro_p"] > 0.05
+    summary["low_n_warning"] = summary["n"] < 20   # Shapiro unreliable at low n
+
+    # Figure 1: grid with histogram+KDE, boxplot, Q-Q plot per group
+    fig, axes = plt.subplots(n_groups, 3, figsize=(15, 4 * n_groups), dpi=dpi)
+    if n_groups == 1:
+        axes = axes.reshape(1, 3)
+    fig.suptitle(f"Checks: {value_col} distribution per {group_a} x {group_b}",
+                 fontsize=16, y=1.005)
+
+    for row_i, ((g1, g2), gdf) in enumerate(groups):
+        vals = gdf[value_col].dropna().to_numpy()
+
+        ax = axes[row_i, 0]
+        if len(vals) >= 2:
+            ax.hist(vals, bins=min(12, max(3, len(vals) // 3)), density=True,
+                    alpha=0.6, color="steelblue", edgecolor="white")
+            if len(vals) >= 3 and np.std(vals) > 0:
+                kde = stats.gaussian_kde(vals)
+                xs = np.linspace(vals.min(), vals.max(), 200)
+                ax.plot(xs, kde(xs), color="darkred", lw=2)
+        ax.set_title(f"{g1} - {g2}\nHistogram + KDE (n={len(vals)})")
+        ax.set_xlabel(value_col)
+
+        ax = axes[row_i, 1]
+        ax.boxplot(vals, patch_artist=True,
+                   boxprops=dict(facecolor="lightgreen", alpha=0.7))
+        ax.set_title(f"{g1} - {g2}\nBoxplot")
+        ax.set_xticks([])
+
+        ax = axes[row_i, 2]
+        if len(vals) >= 3:
+            stats.probplot(vals, dist="norm", plot=ax)
+            p_val = shapiro_results.loc[(g1, g2), "shapiro_p"]
+            ax.set_title(f"{g1} - {g2}\nQ-Q plot (Shapiro p={p_val:.3f})")
+        else:
+            ax.text(0.5, 0.5, "Too few obs.", ha="center", va="center")
+            ax.set_title(f"{g1} - {g2}\nQ-Q plot")
+
+    plt.tight_layout()
+    display(fig)
+    plt.close(fig)
+
+    # Figure 2: overview boxplot, coloured by group_b
+    a_vals = list(d[group_a].dropna().unique())
+    b_vals = list(d[group_b].dropna().unique())
+    palette = plt.cm.tab10(np.linspace(0, 1, len(b_vals)))
+    color_map = dict(zip(b_vals, palette))
+
+    fig2, ax = plt.subplots(figsize=(max(9, 1.8 * n_groups), 5.5), dpi=dpi)
+    positions, data_to_plot, labels, colors = [], [], [], []
+    pos = 0
+    for a in a_vals:
+        for b in b_vals:
+            sub = d[(d[group_a] == a) & (d[group_b] == b)][value_col].dropna()
+            if len(sub) == 0:
+                continue
+            data_to_plot.append(sub.to_numpy())
+            labels.append(f"{a}\n{b}")
+            colors.append(color_map[b])
+            positions.append(pos)
+            pos += 1
+        pos += 0.5
+
+    bp = ax.boxplot(data_to_plot, positions=positions, patch_artist=True, widths=0.6)
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel(value_col)
+    ax.set_title(f"Overview: {value_col} spread per {group_a} and {group_b}")
+    ax.legend(handles=[Patch(facecolor=color_map[b], label=str(b)) for b in b_vals])
+    plt.tight_layout()
+    display(fig2)
+    plt.close(fig2)
+
+    print("=== Summary per group ===")
+    print(summary.to_string())
+    print("\nNote: Shapiro-Wilk almost always gives p below 0.05 when n is large, "
+          "whatever the distribution looks like. Look at the histogram and Q-Q "
+          "plot, not only the p-value. Below n = 20 the test is unreliable "
+          "(low_n_warning).")
+    return summary
+
+
+def step_diagnostics(state):
+    """
+    Step 3: distribution checks. Y from step 2 is the first categorical
+    column. Pick one more categorical column and one numeric column, and
+    press "Show checks". Uses the filtered data from step 2.
+    The summary table is stored in state["diagnostics"].
+    """
+    w = {"description_width": "90px"}
+    y_html = widgets.HTML()
+    cat_menu = widgets.Dropdown(options=[], description="Categorical:", style=w,
+                                layout=widgets.Layout(width="330px"))
+    num_menu = widgets.Dropdown(options=[], description="Numeric:", style=w,
+                                layout=widgets.Layout(width="330px"))
+    max_field = widgets.IntText(value=25, description="Max groups:", style=w,
+                                layout=widgets.Layout(width="220px"))
+    show_btn = widgets.Button(description="Show checks", button_style="info",
+                              layout=widgets.Layout(width="200px"))
+    out = widgets.Output()
+
+    def fill():
+        if state["filtered"] is None or state["selection"] is None:
+            y_html.value = "Run 'Apply and filter' in step 2 first."
+            cat_menu.options = []
+            num_menu.options = []
+            return
+        d, y, xs = state["filtered"], state["selection"]["y"], state["selection"]["xs"]
+        y_html.value = f"Y (categorical): <b>{y}</b>"
+        cat = [c for c in d.columns if c != y and _is_cat(d[c])]
+        num = [c for c in d.columns if c != y and _is_num(d[c])]
+        # chosen X first, then the rest
+        cat = [c for c in xs if c in cat] + [c for c in cat if c not in xs]
+        num = [c for c in xs if c in num] + [c for c in num if c not in xs]
+        cat_menu.options = [(str(c), c) for c in cat]
+        num_menu.options = [(str(c), c) for c in num]
+
+    def show(b):
+        with out:
+            clear_output()
+            if state["filtered"] is None:
+                print("Run 'Apply and filter' in step 2 first.")
+                return
+            if cat_menu.value is None or num_menu.value is None:
+                print("Pick both a categorical and a numeric column.")
+                return
+            try:
+                state["diagnostics"] = group_distribution_check(
+                    state["filtered"], state["selection"]["y"], cat_menu.value,
+                    num_menu.value, max_groups=int(max_field.value))
+            except ValueError as e:
+                print(f"Stopped: {e}")
+
+    show_btn.on_click(show)
+    state["_callbacks"]["filtered"]["diagnostics"] = fill
+    fill()
+    state["widgets"]["diagnostics"] = {"cat": cat_menu, "num": num_menu,
+                                       "max": max_field, "show": show_btn, "output": out}
+    display(widgets.VBox([
+        widgets.HTML("<b>Step 3: distribution checks per group</b>"),
+        y_html,
+        widgets.HBox([cat_menu, num_menu, max_field]),
+        widgets.HTML("<small>Groups = Y levels times levels of the categorical "
+                     "column. Each group gives one row of three plots.</small>"),
+        show_btn, out,
+    ]))
+
+
+# ---- Step 4: multinomial logit --------------------------------------------------
+
+DEFAULT_SETTINGS = {
+    # columns
+    "y_col": None,
+    "id_col": None,                # may be None: no clusters or history
+    # time
+    "time_source": "auto",         # auto, date, year_month, year_subperiod, year
+    "date_col": None,              # may be None
+    "date_format": None,           # may be None: automatic
+    "year_col": None,              # may be None if date_col exists
+    "subperiod_col": None,         # may be None
+    "month_col": None,             # may be None
+    # X
+    "x_numeric": [],
+    "x_categorical": [],
+    "log_cols": [],
+    "season_as_x": False,
+    # periods
+    "frequency": "year",           # month, quarter, tertial or year
+    "target_year": 2025,
+    "target_subperiod": 1,
+    "train_from_year": 2015,
+    "train_to_year": 2024,
+    "holdout_periods": 1,
+    # model choice (advanced)
+    "n_validation": 4,
+    "decay_candidates": [1.0, 0.9, 0.8, 0.7, 0.5],
+    "decay_min_gain": 0.01,
+    "epv_ridge_limit": 20,
+    "C_candidates": [100, 30, 10, 3, 1, 0.3, 0.1],
+    "separation_limit": 10.0,
+    # Y handling (advanced)
+    "min_count": None,             # None = max(100, 0.5 % of training rows)
+    "other_label": "OTHER",
+    # checks and imputation (advanced)
+    "flag_share": 0.05,
+    "p_threshold": None,           # may be None: use flag_share
+    "n_imputations": 20,
+    "mar_limit_pp": 10.0,
+    # bootstrap (advanced)
+    "n_bootstrap": 1000,
+    "bootstrap_reselect": False,
+    "seed": 42,
+    # predicted Y per row (advanced)
+    "prediction_col": "predicted_Y",
+    "predict_all_rows": True,      # False: target period only
+    "prediction_all_probs": False, # True: one column per Y level
+    # saving (advanced)
+    "save_dir": None,              # may be None: do not save
+}
+
+
+def attach_predictions(df, result):
+    """
+    Joins the prediction columns from fit_multinomial onto a data frame with
+    the same index as the input. Rows dropped along the way (missing time or
+    id) get NaN.
+    """
+    if not df.index.is_unique:
+        raise ValueError("The index of df is not unique. Run df.reset_index(drop=True) "
+                         "before step 2, so predictions can be joined to the right row.")
+    pred = result["predictions"]
+    existing = [c for c in pred.columns if c in df.columns]
+    if existing:
+        print(f"Columns {existing} already exist and are overwritten.")
+        df = df.drop(columns=existing)
+    return df.join(pred, how="left")
+
+
+def fit_multinomial(df, s):
+    """
+    Multinomial logit for a categorical Y. Estimates P(Y | X) on a training
+    window and uses the model to:
+      1. flag rows where the reported Y is unlikely (selective editing)
+      2. impute Y where it is missing (multiple imputation)
+      3. show how uncertain the aggregates are (cluster bootstrap on id)
+      4. give every row a predicted Y (block 12b)
+
+    s is a dict of settings. Missing keys are filled from DEFAULT_SETTINGS.
+    Prints along the way and returns a dict with the results.
+    """
+    s = {**DEFAULT_SETTINGS, **s}
+    warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+    warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+    rng = np.random.default_rng(s["seed"])
+
+    y_col = s["y_col"]
+    id_col = s["id_col"]
+    time_source = s["time_source"]
+    date_col = s["date_col"]
+    date_format = s["date_format"]
+    year_col = s["year_col"]
+    subperiod_col = s["subperiod_col"]
+    month_col = s["month_col"]
+    x_numeric = list(s["x_numeric"])
+    x_categorical = list(s["x_categorical"])
+    log_cols = list(s["log_cols"])
+    season_as_x = bool(s["season_as_x"])
+    frequency = s["frequency"]
+    target_year = int(s["target_year"])
+    target_subperiod = int(s["target_subperiod"])
+    train_from_year = int(s["train_from_year"])
+    train_to_year = int(s["train_to_year"])
+    holdout_periods = int(s["holdout_periods"])
+    n_validation = int(s["n_validation"])
+    decay_candidates = [float(v) for v in s["decay_candidates"]]
+    decay_min_gain = float(s["decay_min_gain"])
+    epv_ridge_limit = float(s["epv_ridge_limit"])
+    C_ridge = [float(v) for v in s["C_candidates"]]
+    separation_limit = float(s["separation_limit"])
+    min_count_setting = s["min_count"]
+    other_label = str(s["other_label"])
+    flag_share = float(s["flag_share"])
+    p_threshold = s["p_threshold"]
+    n_imputations = int(s["n_imputations"])
+    mar_limit_pp = float(s["mar_limit_pp"])
+    n_bootstrap = int(s["n_bootstrap"])
+    bootstrap_reselect = bool(s["bootstrap_reselect"])
+    save_dir = s["save_dir"]
+
+    if y_col is None or y_col not in df.columns:
+        raise ValueError(f"y_col = {y_col!r} is not in the data.")
+    if not x_numeric and not x_categorical:
+        raise ValueError("Pick at least one X (x_numeric or x_categorical).")
+    for c in x_numeric + x_categorical:
+        if c not in df.columns:
+            raise ValueError(f"X column {c!r} is not in the data.")
+    if y_col in x_numeric or y_col in x_categorical:
+        raise ValueError(f"{y_col} cannot be both Y and X.")
+    for c in log_cols:
+        if c not in x_numeric:
+            raise ValueError(f"log_cols: {c!r} must be a numeric X.")
+    if frequency not in ("month", "quarter", "tertial", "year"):
+        raise ValueError(f"frequency must be month, quarter, tertial or year, "
+                         f"got: {frequency}")
+    if train_from_year > train_to_year:
+        raise ValueError("train_from_year cannot be larger than train_to_year.")
+
+    # ---- 2. Time and keys ----
+
+    per_year = {"month": 12, "quarter": 4, "tertial": 3, "year": 1}[frequency]
+    letter = {"month": "M", "quarter": "Q", "tertial": "T", "year": ""}[frequency]
+
+    def label(period):
+        yr, sub = divmod(int(period), per_year)
+        return f"{yr}" if per_year == 1 else f"{yr}{letter}{sub + 1}"
+
+    d = df.copy()
+
+    if time_source not in ("auto", "date", "year_subperiod", "year_month", "year"):
+        raise ValueError("time_source must be auto, date, year_month, "
+                         f"year_subperiod or year, got: {time_source}")
+
+    def _date_ok(col, fmt):
+        """True if the column reads as a date with sensible years."""
+        if not col or col not in d.columns:
+            return False, None
+        parsed = pd.to_datetime(d[col].astype(str), errors="coerce", format=fmt)
+        if parsed.isna().mean() > 0.05:
+            return False, parsed
+        y_min, y_max = parsed.dt.year.min(), parsed.dt.year.max()
+        if pd.isna(y_min) or y_min < 1990 or y_max > 2100:
+            return False, parsed
+        return True, parsed
+
+    # Find the finest available source. The number is how many periods per
+    # year the source can give.
+    sources = []
+    date_good, dt_parsed = _date_ok(date_col, date_format)
+    if date_good:
+        sources.append(("date", 12))
+    if month_col and month_col in d.columns:
+        sources.append(("year_month", 12))
+    if subperiod_col and subperiod_col in d.columns:
+        sources.append(("year_subperiod", per_year))
+    if year_col and year_col in d.columns:
+        sources.append(("year", 1))
+    if not sources:
+        raise ValueError("No usable time column found. Set date_col, "
+                         "month_col, subperiod_col or year_col.")
+
+    if time_source == "auto":
+        time_source, resolution = sources[0]
+        print(f"Time source picked automatically: {time_source} "
+              f"(candidates: {[k for k, _ in sources]})")
+    else:
+        hits = [v for k, v in sources if k == time_source]
+        if not hits:
+            raise ValueError(f"time_source = '{time_source}' is not available. "
+                             f"Usable sources: {[k for k, _ in sources]}")
+        resolution = hits[0]
+
+    if per_year > resolution:
+        possible = [f for f, n in [("month", 12), ("tertial", 3), ("quarter", 4),
+                                   ("year", 1)] if n <= resolution]
+        raise ValueError(
+            f"frequency = '{frequency}' needs {per_year} periods per year, but "
+            f"time source '{time_source}' only gives {resolution}. "
+            f"Possible frequencies with current columns: {possible}. "
+            "If you have a finer time column, point month_col or date_col to it.")
+
+    if time_source != "year" and (not year_col or year_col not in d.columns) \
+            and time_source != "date":
+        raise ValueError(f"time_source = '{time_source}' needs year_col.")
+
+    if time_source == "date":
+        dt = dt_parsed
+        share_nat = dt.isna().mean()
+        y_min, y_max = dt.dt.year.min(), dt.dt.year.max()
+        odd = (pd.notna(y_min) and y_min < 1990) or (pd.notna(y_max) and y_max > 2100)
+        if share_nat > 0.05 or odd:
+            print(f"WARNING: {date_col} cannot be read as a date with a year.")
+            print(f"  {share_nat:.1%} became NaT, years from {y_min} to {y_max}.")
+            print(f"  Raw examples: "
+                  f"{d[date_col].dropna().astype(str).head(5).tolist()}")
+            print("  If the column is DDMM or MMDD, it has no year. Put the month "
+                  "in its own column and set time_source = 'year_month',")
+            print(f"  or set time_source = 'year_subperiod' and use {year_col} "
+                  f"and {subperiod_col}.")
+            raise ValueError("Stopping: the time column is misread.")
+        d["_year"] = dt.dt.year
+        used = [date_col]
+    else:
+        d["_year"] = pd.to_numeric(d[year_col], errors="coerce")
+        used = [year_col]
+
+    if per_year == 1:
+        # Frequency year: anything finer than year is ignored.
+        d["_sub"] = 1
+        if time_source in ("year_month", "year_subperiod"):
+            print(f"Frequency is year, so "
+                  f"{month_col if time_source == 'year_month' else subperiod_col} "
+                  "is not read.")
+    elif time_source == "date":
+        d["_sub"] = {"month": dt.dt.month,
+                     "quarter": dt.dt.quarter,
+                     "tertial": (dt.dt.month - 1) // 4 + 1}[frequency]
+    elif time_source == "year_month":
+        mon = pd.to_numeric(d[month_col], errors="coerce")
+        if mon.dropna().between(1, 12).mean() < 0.99:
+            raise ValueError(f"{month_col} has values outside 1-12. "
+                             f"Found: {[int(v) for v in sorted(mon.dropna().unique())[:15]]}")
+        d["_sub"] = {"month": mon,
+                     "quarter": (mon - 1) // 3 + 1,
+                     "tertial": (mon - 1) // 4 + 1}[frequency]
+        used.append(month_col)
+    elif time_source == "year_subperiod":
+        d["_sub"] = pd.to_numeric(d[subperiod_col], errors="coerce")
+        if d["_sub"].dropna().between(1, per_year).mean() < 0.99:
+            raise ValueError(f"{subperiod_col} has values outside 1-{per_year}, "
+                             f"which frequency '{frequency}' needs. Found: "
+                             f"{[int(v) for v in sorted(d['_sub'].dropna().unique())[:15]]}")
+        used.append(subperiod_col)
+    else:
+        raise ValueError(f"time_source = 'year' needs frequency = 'year', not "
+                         f"'{frequency}'. Give a finer time column.")
+
+    print(f"Time taken from    : {', '.join(used)}")
+
+    use_clusters = id_col is not None
+    if not use_clusters:
+        print("No id column given. No history profile is built, and the "
+              "bootstrap draws single rows instead of units.")
+    missing_key = d["_year"].isna() | d["_sub"].isna()
+    if use_clusters:
+        missing_key = missing_key | d[id_col].isna()
+    if missing_key.any():
+        print(f"WARNING: {int(missing_key.sum())} rows miss time or "
+              f"{id_col} and are dropped.")
+        d = d[~missing_key].copy()
+    d["_year"] = d["_year"].astype(int)
+    d["_sub"] = d["_sub"].astype(int)
+    if use_clusters:
+        d[id_col] = d[id_col].astype(str)
+    d["period"] = d["_year"] * per_year + d["_sub"] - 1
+
+    target_period = target_year * per_year + (target_subperiod - 1 if per_year > 1 else 0)
+    window_from = train_from_year * per_year
+    window_to = train_to_year * per_year + per_year - 1
+    in_window = d["period"].between(window_from, window_to)
+
+    window_periods = sorted(d.loc[in_window, "period"].unique())
+    if len(window_periods) <= holdout_periods + 1:
+        raise ValueError(f"Only {len(window_periods)} periods in the window. Widen "
+                         "the window or lower holdout_periods.")
+    holdout = window_periods[-holdout_periods:] if holdout_periods > 0 else []
+    dev_periods = [q for q in window_periods if q not in holdout]
+    last_dev = max(dev_periods)
+    last_window = max(window_periods)
+
+    print(f"Frequency          : {frequency} ({per_year} per year)")
+    print(f"Target period      : {label(target_period)}")
+    print(f"Training window    : {label(window_from)} to {label(window_to)}, "
+          f"{len(window_periods)} periods")
+    print(f"  development      : {label(dev_periods[0])} to {label(last_dev)}")
+    print(f"  holdout          : {[label(q) for q in holdout] or 'none'}")
+    gap = target_period - last_window
+    if gap > 1:
+        print(f"NOTE: {gap - 1} periods between the window and the target are not used.")
+    if (d["period"] == target_period).sum() == 0:
+        raise ValueError(f"No rows in the target period {label(target_period)}. "
+                         "Check target_year and target_subperiod.")
+
+    print("\nRows per period:")
+    ov = d.groupby("period").size().rename("rows").reset_index()
+    ov["period_label"] = ov["period"].map(label)
+    ov["role"] = np.where(ov["period"] == target_period, "target",
+                 np.where(ov["period"].isin(holdout), "holdout",
+                 np.where(ov["period"].isin(dev_periods), "development", "")))
+    print(ov[["period_label", "rows", "role"]].to_string(index=False))
+
+    # ---- 3. Y and X ----
+
+    d[y_col] = d[y_col].astype("string").str.strip()
+    d.loc[d[y_col].isin(["", "nan", "<NA>", "None"]), y_col] = pd.NA
+
+    for c in log_cols:
+        d[c] = np.log(pd.to_numeric(d[c], errors="coerce").clip(lower=1))
+    for c in x_numeric:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if season_as_x and per_year > 1:
+        d["season"] = d["_sub"]
+        x_categorical = [c for c in x_categorical
+                         if c not in ("season", subperiod_col)] + ["season"]
+
+    for c in x_categorical:
+        n_missing = int(d[c].isna().sum())
+        d[c] = d[c].astype("string").fillna("missing")
+        if n_missing:
+            print(f"{c}: {n_missing} rows have no value, coded as 'missing'")
+
+    # Y levels below min_count are merged
+    n_train = int(in_window.sum())
+    if min_count_setting is None:
+        min_count = max(100, 0.005 * n_train)
+        print(f"\nmin_count automatic: {min_count:.0f} "
+              f"(max(100, 0.5 percent of {n_train} rows in the window))")
+    else:
+        min_count = float(min_count_setting)
+        print(f"\nmin_count set by hand: {min_count:.0f}")
+
+    counts = d.loc[in_window, y_col].value_counts()
+    small = counts[counts < min_count]
+    if len(small) > 0:
+        print(f"Merging {len(small)} Y levels into '{other_label}': "
+              f"{list(small.index)} ({small.sum()} rows in the window)")
+        d.loc[d[y_col].isin(small.index), y_col] = other_label
+
+    # Levels that only exist outside the window
+    valid_levels = set(d.loc[in_window, y_col].dropna().unique())
+    unseen = d[y_col].notna() & ~d[y_col].isin(valid_levels)
+    if unseen.any():
+        print(f"{int(unseen.sum())} rows have Y levels not seen in the window "
+              f"({sorted(d.loc[unseen, y_col].unique())}), coded as '{other_label}'.")
+        d.loc[unseen, y_col] = other_label
+
+    print("\nLevels per categorical X in the window:")
+    for c in x_categorical:
+        n_lev = d.loc[in_window, c].nunique()
+        note = "  <- too many, group before running" if n_lev > 50 else ""
+        print(f"  {c:18s} {n_lev:5d}{note}")
+
+    # ---- 4. Unit history profile of Y ----
+    # Only from periods in the window and only from periods BEFORE the row.
+
+    if use_clusters:
+        obs = d[d[y_col].notna() & in_window]
+        tally = (obs.groupby([id_col, "period", y_col], observed=True).size()
+                 .unstack(fill_value=0))
+        all_periods = sorted(d["period"].unique())
+        grid = pd.MultiIndex.from_product([d[id_col].unique(), all_periods],
+                                          names=[id_col, "period"])
+        tally = tally.reindex(grid, fill_value=0).sort_index()
+        cum = tally.groupby(level=0, observed=True).cumsum()
+        cum = cum.groupby(level=0, observed=True).shift(1).fillna(0)
+        profile = cum.div(cum.sum(axis=1).replace(0, np.nan), axis=0)
+        profile.columns = [f"hist_{c}" for c in profile.columns]
+        profile["has_history"] = (cum.sum(axis=1) > 0).astype(float)
+        base = obs[y_col].value_counts(normalize=True)
+        for k in base.index:
+            profile[f"hist_{k}"] = profile[f"hist_{k}"].fillna(base[k])
+        d = d.join(profile, on=[id_col, "period"])
+        x_num_all = x_numeric + list(profile.columns)
+    else:
+        x_num_all = list(x_numeric)
+
+    # ---- 5. Design matrix, missing X, EPV, null model ----
+
+    X = pd.get_dummies(d[x_num_all + x_categorical], columns=x_categorical,
+                       drop_first=True, dtype=float)
+    levels = sorted(d[y_col].dropna().unique())
+    if len(levels) < 2:
+        raise ValueError(f"Y has only {len(levels)} level after merging. "
+                         "Lower min_count or pick another Y.")
+    train = d[y_col].notna() & in_window
+    dev = d[y_col].notna() & d["period"].isin(dev_periods)
+    hold = d[y_col].notna() & d["period"].isin(holdout)
+    target_obs = (d["period"] == target_period) & d[y_col].notna()
+    target_na = (d["period"] == target_period) & d[y_col].isna()
+
+    nan_cols = X.isna().sum()
+    nan_cols = nan_cols[nan_cols > 0]
+    if len(nan_cols):
+        print("\nMissing values in X:")
+        for c in list(nan_cols.index):
+            print(f"  {c}: {nan_cols[c]} rows ({100 * nan_cols[c] / len(X):.2f} percent)")
+            if X[c].isna().all():
+                X = X.drop(columns=c)
+                print(f"  {c} is empty and dropped.")
+                continue
+            X[f"missing_{c}"] = X[c].isna().astype(float)
+            med = X.loc[train, c].median()
+            med = X[c].median() if pd.isna(med) else med
+            X[c] = X[c].fillna(0.0 if pd.isna(med) else med)
+
+    # standardise on the training window, needed for ridge and good for convergence
+    mu = X.loc[train].mean()
+    sd = X.loc[train].std().replace(0, 1.0)
+    X = (X - mu) / sd
+
+    smallest = d.loc[train, y_col].value_counts().min()
+    n_params = (len(levels) - 1) * X.shape[1]
+    epv = smallest / n_params
+    use_ridge = epv < epv_ridge_limit
+    C_list = C_ridge if use_ridge else [np.inf]
+
+    print(f"\nRows               : {len(d)}")
+    if use_clusters:
+        n_units = d[id_col].nunique()
+        print(f"Units (clusters)   : {n_units} ({id_col})")
+        if n_units < 30:
+            print("  WARNING: fewer than 30 clusters. The cluster bootstrap then "
+                  "gives too narrow intervals.")
+        if id_col in x_categorical or id_col in x_numeric:
+            print(f"  WARNING: {id_col} is both id and predictor. The profile then "
+                  "becomes target coding of the same column, and the "
+                  "coefficients become unstable.")
+    else:
+        print("Units (clusters)   : no id column")
+    print(f"Y levels           : {len(levels)}  {levels}")
+    print(f"Predictor columns  : {X.shape[1]}")
+    print(f"Coefficients       : {n_params}")
+    print(f"EPV                : {epv:.1f}  ->  "
+          + ("ridge on" if use_ridge else "plain ML"))
+    if epv < 10:
+        print("  WARNING: EPV below 10. Results are likely miscalibrated.")
+    if use_clusters:
+        print(f"No history in target period: "
+              f"{1 - d.loc[d['period'] == target_period, 'has_history'].mean():.1%}")
+
+    # null model: guess the distribution in the development periods
+    null_p = d.loc[dev, y_col].value_counts(normalize=True).reindex(levels).fillna(0)
+
+    def fit(Xm, ym, per, decay, C, end):
+        """Weighted multinomial logit. per is the period number per row."""
+        w = decay ** (end - per)
+        m = LogisticRegression(C=C, max_iter=3000)
+        m.fit(Xm, ym, sample_weight=w)
+        return m
+
+    def loss(m, Xm, ym):
+        return log_loss(ym, m.predict_proba(Xm), labels=list(m.classes_))
+
+    def null_loss(ym):
+        P = np.tile(null_p.to_numpy(), (len(ym), 1))
+        return log_loss(ym, P, labels=levels)
+
+    def choose(Xm, ym, per, periods):
+        """Picks (decay, C) by out-of-time validation. Returns (scores, validation)."""
+        ordered = sorted(periods)
+        possible = ordered[2:]
+        validation = possible[-n_validation:] if possible else []
+        scores = {}
+        for decay in decay_candidates:
+            for C in C_list:
+                t = []
+                for q in validation:
+                    tr = (per < q).to_numpy()
+                    te = (per == q).to_numpy()
+                    if tr.sum() < 100 or ym[tr].nunique() < len(levels):
+                        continue
+                    m = fit(Xm[tr], ym[tr], per[tr], decay, C, q - 1)
+                    t.append(loss(m, Xm[te], ym[te]))
+                if t:
+                    scores[(decay, C)] = np.mean(t)
+        return scores, validation
+
+    # ---- 6. Is missing Y random given X? ----
+
+    print("\nComparing X between rows with and without Y (window + target):")
+    with_y = d[y_col].notna() & (in_window | (d["period"] == target_period))
+    without_y = d[y_col].isna() & (in_window | (d["period"] == target_period))
+    print(f"  {int(with_y.sum())} with Y, {int(without_y.sum())} without Y")
+    mar_flags = []
+    if without_y.sum() < 20:
+        print("  Too few rows without Y to compare. Skipping.")
+        x_cat_mar, x_num_mar = [], []
+    else:
+        x_cat_mar, x_num_mar = x_categorical, x_numeric
+    for c in x_cat_mar:
+        a = d.loc[with_y, c].value_counts(normalize=True)
+        b = d.loc[without_y, c].value_counts(normalize=True)
+        idx = a.index.union(b.index)
+        diff = (b.reindex(idx).fillna(0) - a.reindex(idx).fillna(0)) * 100
+        worst = diff.abs().idxmax()
+        print(f"  {c:18s} largest gap {diff[worst]:+.1f} pp ({worst})")
+        if abs(diff[worst]) > mar_limit_pp:
+            mar_flags.append(c)
+    for c in x_num_mar:
+        s_with = pd.to_numeric(d.loc[with_y, c], errors="coerce").astype(float)
+        s_without = pd.to_numeric(d.loc[without_y, c], errors="coerce").astype(float)
+        sd_with = s_with.std()
+        if s_without.notna().sum() == 0 or not np.isfinite(sd_with) or sd_with == 0:
+            continue
+        z = float((s_without.mean() - s_with.mean()) / sd_with)
+        print(f"  {c:18s} mean difference {z:+.2f} sd")
+        if abs(z) > 0.5:
+            mar_flags.append(c)
+    if without_y.sum() >= 20 and mar_flags:
+        print(f"  WARNING: missing Y is skewed on {mar_flags}. The imputation "
+              "can be biased where X does not capture the difference.")
+    elif without_y.sum() >= 20:
+        print("  No large differences. The MAR assumption looks reasonable.")
+
+    # ---- 7. Out-of-time model choice on the development periods ----
+
+    scores, validation = choose(X[dev], d.loc[dev, y_col], d.loc[dev, "period"],
+                                dev_periods)
+    print(f"\nOut-of-time model choice on {[label(q) for q in validation]}:")
+    if not scores:
+        best_decay, best_C = 1.0, C_list[0]
+        print(f"  Too few periods to validate. decay = 1.0, C = {best_C}.")
+    else:
+        for (decay, C), v in sorted(scores.items()):
+            print(f"  decay = {decay:.1f}  C = {C:<6}  log-loss = {v:.4f}")
+        null_v = np.mean([null_loss(d.loc[dev & (d["period"] == q), y_col])
+                          for q in validation])
+        print(f"  null model (guess the distribution)   log-loss = {null_v:.4f}")
+        (best_decay, best_C) = min(scores, key=scores.get)
+        best, worst = min(scores.values()), max(scores.values())
+        if (worst - best) / best < decay_min_gain:
+            print(f"  Gap between best and worst is below "
+                  f"{100 * decay_min_gain:.0f} percent. The choice is not "
+                  "informative, using decay = 1.0.")
+            best_decay = 1.0
+            best_C = min((k for k in scores if k[0] == 1.0), key=scores.get,
+                         default=(1.0, C_list[0]))[1]
+        gain = 100 * (null_v - scores[(best_decay, best_C)]) / null_v
+        print(f"  Best model is {gain:.1f} percent better than the null model.")
+        if gain < 2:
+            print("  WARNING: the model explains almost nothing beyond the "
+                  "distribution. The predictors carry little information.")
+
+    half = np.log(0.5) / np.log(best_decay) if best_decay < 1 else np.inf
+    print(f"Chosen             : decay = {best_decay}"
+          + (f" (half-life {half:.1f} periods)" if best_decay < 1 else "")
+          + f", C = {best_C}")
+
+    # ---- 8. Independent test on the holdout period ----
+    # This period has not been used for any choice. One number, once.
+
+    cal_hold = None
+    if holdout:
+        m_dev = fit(X[dev], d.loc[dev, y_col], d.loc[dev, "period"],
+                    best_decay, best_C, last_dev)
+        h_model = loss(m_dev, X[hold], d.loc[hold, y_col])
+        h_null = null_loss(d.loc[hold, y_col])
+        print(f"\nHoldout test on {[label(q) for q in holdout]} (n = {int(hold.sum())}):")
+        print(f"  model log-loss {h_model:.4f}, null model {h_null:.4f}, "
+              f"gain {100 * (h_null - h_model) / h_null:.1f} percent")
+        cal_hold = pd.DataFrame({
+            "predicted": pd.Series(m_dev.predict_proba(X[hold]).mean(axis=0),
+                                   index=m_dev.classes_),
+            "observed": d.loc[hold, y_col].value_counts(normalize=True)})
+        cal_hold["gap_pp"] = 100 * (cal_hold["observed"] - cal_hold["predicted"])
+        print(cal_hold.round(4).to_string())
+        print("  Gaps here are model error, not data error. Use them as a "
+              "reference for normal gaps in the target period.")
+
+    # ---- 9. Main model on the full window ----
+
+    model = fit(X[train], d.loc[train, y_col], d.loc[train, "period"],
+                best_decay, best_C, last_window)
+    target_all = (d["period"] == target_period)
+    probs = pd.DataFrame(np.nan, index=d.index, columns=model.classes_)
+    probs.loc[target_all, :] = model.predict_proba(X[target_all.to_numpy()])
+
+    coef = pd.DataFrame(model.coef_, index=model.classes_, columns=X.columns)
+    large = coef.abs().max()
+    large = large[large > separation_limit]
+    if len(large):
+        print(f"\nWARNING: {len(large)} columns have |coefficient| above "
+              f"{separation_limit} (standardised scale), a sign of separation:")
+        for c, v in large.sort_values(ascending=False).head(10).items():
+            print(f"  {c}: {v:.1f}")
+        print("  Merge levels, or set epv_ridge_limit higher.")
+
+    cal = pd.DataFrame({
+        "predicted": probs.loc[target_obs].mean(),
+        "observed": d.loc[target_obs, y_col].value_counts(normalize=True)})
+    cal["gap_pp"] = 100 * (cal["observed"] - cal["predicted"])
+    print(f"\nCalibration in target period {label(target_period)} "
+          f"(n = {int(target_obs.sum())}):")
+    print(cal.round(4).to_string())
+
+    # ---- 10. Selective editing ----
+
+    reported = d.loc[target_obs, y_col]
+    d.loc[target_obs, "p_reported"] = probs.loc[target_obs].to_numpy()[
+        np.arange(int(target_obs.sum())),
+        [list(model.classes_).index(k) for k in reported]]
+    d.loc[target_obs, "expected"] = probs.loc[target_obs].idxmax(axis=1)
+
+    if p_threshold is not None:
+        flagged = target_obs & (d["p_reported"] < float(p_threshold))
+        reason = f"probability below {p_threshold}"
+    else:
+        d.loc[target_obs, "rank_pct"] = d.loc[target_obs, "p_reported"].rank(pct=True)
+        flagged = target_obs & (d["rank_pct"] <= flag_share)
+        reason = (f"the weakest {100 * flag_share:.0f} percent, equal to "
+                  f"p below {d.loc[flagged, 'p_reported'].max():.4f}")
+
+    print(f"\nSelective editing: {int(flagged.sum())} rows flagged ({reason})")
+    print("Flags as share of rows in the group:")
+    for col in x_categorical:
+        a = (d.loc[flagged].groupby(col, observed=True).size()
+             / d.loc[target_obs].groupby(col, observed=True).size()).dropna()
+        if a.nunique() > 1:
+            print(f"  {col}: highest {a.idxmax()} {a.max():.3f}, "
+                  f"lowest {a.idxmin()} {a.min():.3f}")
+    if use_clusters:
+        most = d.loc[flagged, id_col].value_counts().head(5)
+        print("Units with most flags: " + str({str(k): int(v) for k, v in most.items()}))
+
+    if "is_error" in d.columns:            # demo only, remove for real data
+        n_err = int(d.loc[target_obs, "is_error"].sum())
+        found = int(d.loc[flagged, "is_error"].sum())
+        print(f"[demo] caught {found} of {n_err} planted errors, a random "
+              f"sample would give {n_err / int(target_obs.sum()) * flagged.sum():.1f}")
+
+    # ---- 11. Multiple imputation ----
+
+    imputation = None
+    print(f"\nMissing Y in the target period: {int(target_na.sum())} rows")
+    if target_na.sum() > 0:
+        p_na = probs.loc[target_na].to_numpy()
+        shares = []
+        for i in range(n_imputations):
+            drawn = [rng.choice(model.classes_, p=r) for r in p_na]
+            shares.append(pd.concat([d.loc[target_obs, y_col], pd.Series(drawn)])
+                          .value_counts(normalize=True))
+        imputation = pd.DataFrame(shares)
+        print(f"Share after imputation ({n_imputations} draws):")
+        print(pd.DataFrame({"share": imputation.mean(), "sd_imp": imputation.std()})
+              .round(4).to_string())
+
+    # ---- 12. Cluster bootstrap ----
+
+    X_np = X.to_numpy()
+    y_np = d[y_col].to_numpy()
+    per_np = d["period"].to_numpy()
+    y_ok = d[y_col].notna().to_numpy()
+    in_window_np = d["period"].between(window_from, window_to).to_numpy()
+    dev_np = d["period"].isin(dev_periods).to_numpy()
+    X_target = X_np[target_obs.to_numpy()]
+    n_levels = len(levels)
+
+    if use_clusters:
+        units = d[id_col].unique()
+        rows_per_unit = d.groupby(id_col, observed=True).indices
+
+    # Draw all indices first, in order, so the draws do not depend on
+    # how the work is split across cores.
+    all_idx = []
+    for b in range(n_bootstrap):
+        if use_clusters:
+            picked = rng.choice(units, len(units), replace=True)
+            all_idx.append(np.concatenate([rows_per_unit[u] for u in picked]))
+        else:
+            all_idx.append(rng.choice(len(d), len(d), replace=True))
+
+    def one_round(idx):
+        mask = y_ok[idx] & in_window_np[idx]
+        tr = idx[mask]
+        if len(tr) < 100 or len(np.unique(y_np[tr])) < n_levels:
+            return None
+        decay_b, C_b = best_decay, best_C
+        if bootstrap_reselect:
+            dev_b = idx[mask & dev_np[idx]]
+            scores_b, _ = choose(X_np[dev_b], pd.Series(y_np[dev_b]),
+                                 pd.Series(per_np[dev_b]), dev_periods)
+            if scores_b:
+                decay_b, C_b = min(scores_b, key=scores_b.get)
+        w = decay_b ** (last_window - per_np[tr])
+        mb = LogisticRegression(C=C_b, max_iter=3000)
+        mb.fit(X_np[tr], y_np[tr], sample_weight=w)
+        return pd.Series(mb.predict_proba(X_target).mean(axis=0), index=mb.classes_)
+
+    boot = Parallel(n_jobs=-1)(delayed(one_round)(i) for i in all_idx)
+    boot = pd.DataFrame([b for b in boot if b is not None])
+
+    if len(boot) < 50:
+        print(f"\nNOTE: only {len(boot)} bootstrap rounds. The intervals are "
+              "unreliable. Set n_bootstrap to at least 100 for real use.")
+    summary = pd.DataFrame({
+        "predicted": probs.loc[target_obs].mean(),
+        "boot_sd": boot.std(),
+        "lower_95": boot.quantile(0.025),
+        "upper_95": boot.quantile(0.975),
+        "observed": d.loc[target_obs, y_col].value_counts(normalize=True)})
+    summary["outside"] = ~summary["observed"].between(summary["lower_95"],
+                                                      summary["upper_95"])
+    print("\nBootstrap on "
+          + (f"{id_col} (clusters)" if use_clusters else "single rows")
+          + f", {len(boot)} rounds"
+          + (" (decay/C chosen again each round)" if bootstrap_reselect
+             else " (decay/C held fixed, uncertainty in that choice not included)")
+          + ":")
+    print(summary.round(4).to_string())
+    outside = summary[summary["outside"]]
+    print("Y levels outside the interval: "
+          + (", ".join(outside.index) if len(outside) else "none"))
+
+    # ---- 12b. Predicted Y per row ----
+    # Most likely level for each row. In the target period this is out of
+    # sample. In the window it is in sample and only a diagnostic.
+
+    pred_name = str(s["prediction_col"])
+    pred_rows = (pd.Series(True, index=d.index) if s["predict_all_rows"]
+                 else (d["period"] == target_period))
+    P = model.predict_proba(X[pred_rows.to_numpy()])
+    classes = list(model.classes_)
+
+    pred = pd.DataFrame(index=d.index[pred_rows])
+    pred[pred_name] = np.array(classes)[P.argmax(axis=1)]
+    pred[f"{pred_name}_p"] = P.max(axis=1)
+    pred[f"{pred_name}_reported"] = d.loc[pred_rows, y_col].to_numpy()
+
+    has_y = d.loc[pred_rows, y_col].notna().to_numpy()
+    p_rep = np.full(len(pred), np.nan)
+    if has_y.any():
+        col_idx = [classes.index(k) for k in d.loc[pred_rows, y_col][has_y]]
+        p_rep[has_y] = P[np.where(has_y)[0], col_idx]
+    pred[f"{pred_name}_p_reported"] = p_rep
+
+    per_pred = d.loc[pred_rows, "period"]
+    pred[f"{pred_name}_role"] = np.select(
+        [per_pred == target_period, per_pred.isin(holdout), per_pred.isin(dev_periods)],
+        ["target", "holdout", "development"], default="outside window")
+    pred[f"{pred_name}_differs"] = has_y & (
+        pred[pred_name].to_numpy() != pred[f"{pred_name}_reported"].to_numpy())
+    if s["prediction_all_probs"]:
+        for j, k in enumerate(classes):
+            pred[f"{pred_name}_p_{k}"] = P[:, j]
+
+    print(f"\nPredicted Y stored in column '{pred_name}' for {len(pred)} rows.")
+    print("Share of rows where predicted Y differs from reported, per role:")
+    print((pred[pred[f"{pred_name}_reported"].notna()]
+           .groupby(f"{pred_name}_role")[f"{pred_name}_differs"]
+           .agg(rows="size", share_differs="mean")).round(3).to_string())
+    print("  Differences in 'development' and 'holdout' are in sample and only "
+          "a diagnostic. 'target' is out of sample.")
+    n_no_y = int((~has_y).sum())
+    if n_no_y:
+        print(f"  {n_no_y} rows without reported Y got the most likely level. "
+              "That is a single imputation; use the imputation table for aggregates.")
+
+    # ---- 13. Saving ----
+
+    used_settings = {"frequency": frequency, "time_source": time_source,
+                     "decay": best_decay, "C": best_C, "epv": epv,
+                     "n_bootstrap": len(boot), "min_count": min_count,
+                     "prediction_col": pred_name}
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        tag = f"{y_col}_{label(target_period)}"
+        d.loc[flagged].to_parquet(f"{save_dir}/flagged_{tag}.parquet")
+        pred.to_parquet(f"{save_dir}/predicted_{tag}.parquet")
+        cal.to_csv(f"{save_dir}/calibration_{tag}.csv")
+        summary.to_csv(f"{save_dir}/bootstrap_{tag}.csv")
+        pd.Series({k: str(v) for k, v in used_settings.items()}).to_csv(
+            f"{save_dir}/settings_{tag}.csv")
+        print(f"\nSaved to {save_dir}/")
+
+    return {
+        "data": d, "X": X, "model": model, "probs": probs,
+        "calibration": cal, "calibration_holdout": cal_hold, "summary": summary,
+        "bootstrap": boot, "flagged": d.loc[flagged].copy(),
+        "imputation": imputation, "predictions": pred, "settings": used_settings,
+    }
+
+
+def step_model(state):
+    """
+    Step 4: settings for the multinomial logit as widgets, and a button that
+    runs fit_multinomial on the filtered data from step 2.
+
+    Required choices are at the top. The rest is under "Advanced settings".
+    Columns marked "may be None" can be set to "(none)".
+
+    Results are stored in state["result"], and the data with predicted Y per
+    row in state["predicted"].
+    """
+    none = "(none)"
+    w = {"description_width": "200px"}
+    wide = widgets.Layout(width="460px")
+    narrow = widgets.Layout(width="300px")
+
+    y_html = widgets.HTML()
+    id_menu = widgets.Dropdown(description="id_col (may be None):", style=w, layout=wide)
+    source_menu = widgets.Dropdown(
+        options=["auto", "date", "year_month", "year_subperiod", "year"], value="auto",
+        description="time_source:", style=w, layout=wide)
+    date_menu = widgets.Dropdown(description="date_col (may be None):", style=w, layout=wide)
+    date_fmt_field = widgets.Text(
+        value="", placeholder="empty = automatic, e.g. %Y%m%d",
+        description="date_format (may be None):", style=w, layout=wide)
+    year_menu = widgets.Dropdown(description="year_col (may be None):", style=w, layout=wide)
+    sub_menu = widgets.Dropdown(description="subperiod_col (may be None):", style=w, layout=wide)
+    month_menu = widgets.Dropdown(description="month_col (may be None):", style=w, layout=wide)
+
+    x_type_box = widgets.VBox()
+    x_type_menus = {}
+    log_menu = widgets.SelectMultiple(
+        options=[], description="log_cols:", style=w,
+        layout=widgets.Layout(width="460px", height="90px"))
+    season_box = widgets.Checkbox(value=False, indent=False,
+                                  description="season_as_x (subperiod as category)")
+
+    freq_menu = widgets.Dropdown(
+        options=["month", "quarter", "tertial", "year"], value="year",
+        description="frequency:", style=w, layout=wide)
+    target_year_field = widgets.IntText(value=2025, description="target_year:",
+                                        style=w, layout=narrow)
+    target_sub_field = widgets.IntText(value=1, description="target_subperiod:",
+                                       style=w, layout=narrow)
+    from_field = widgets.IntText(value=2015, description="train_from_year:",
+                                 style=w, layout=narrow)
+    to_field = widgets.IntText(value=2024, description="train_to_year:",
+                               style=w, layout=narrow)
+    holdout_field = widgets.IntText(value=1, description="holdout_periods:",
+                                    style=w, layout=narrow)
+
+    # advanced settings
+    n_val_field = widgets.IntText(value=4, description="n_validation:", style=w, layout=narrow)
+    decay_field = widgets.Text(value="1.0, 0.9, 0.8, 0.7, 0.5",
+                               description="decay_candidates:", style=w, layout=wide)
+    decay_gain_field = widgets.FloatText(value=0.01, description="decay_min_gain:",
+                                         style=w, layout=narrow)
+    epv_field = widgets.FloatText(value=20, description="epv_ridge_limit:",
+                                  style=w, layout=narrow)
+    C_field = widgets.Text(value="100, 30, 10, 3, 1, 0.3, 0.1",
+                           description="C_candidates:", style=w, layout=wide)
+    sep_field = widgets.FloatText(value=10.0, description="separation_limit:",
+                                  style=w, layout=narrow)
+    min_auto = widgets.Checkbox(
+        value=True, indent=False,
+        description="min_count automatic: max(100, 0.5 percent of rows in window)")
+    min_field = widgets.IntText(value=100, description="min_count:", style=w,
+                                layout=narrow, disabled=True)
+    other_field = widgets.Text(value="OTHER", description="other_label:",
+                               style=w, layout=narrow)
+    share_field = widgets.FloatText(value=0.05, description="flag_share:",
+                                    style=w, layout=narrow)
+    thresh_field = widgets.Text(value="", placeholder="empty = None, use flag_share",
+                                description="p_threshold (may be None):", style=w, layout=wide)
+    n_imp_field = widgets.IntText(value=20, description="n_imputations:",
+                                  style=w, layout=narrow)
+    mar_field = widgets.FloatText(value=10.0, description="mar_limit_pp:",
+                                  style=w, layout=narrow)
+    n_boot_field = widgets.IntText(value=1000, description="n_bootstrap:",
+                                   style=w, layout=narrow)
+    reselect_box = widgets.Checkbox(value=False, indent=False,
+                                    description="bootstrap_reselect (slow)")
+    seed_field = widgets.IntText(value=42, description="seed:", style=w, layout=narrow)
+    save_field = widgets.Text(value="", placeholder="empty = do not save",
+                              description="save_dir (may be None):", style=w, layout=wide)
+
+    # predicted Y per row
+    pred_name_field = widgets.Text(value="predicted_Y", description="prediction_col:",
+                                   style=w, layout=narrow)
+    pred_all_box = widgets.Checkbox(
+        value=True, indent=False,
+        description="predict_all_rows (off: target period only)")
+    pred_probs_box = widgets.Checkbox(
+        value=False, indent=False,
+        description="prediction_all_probs (one column per Y level)")
+
+    def min_auto_changed(change):
+        min_field.disabled = bool(change["new"])
+    min_auto.observe(min_auto_changed, names="value")
+
+    advanced_content = widgets.VBox([
+        widgets.HTML("<b>Model choice</b>"),
+        n_val_field, decay_field, decay_gain_field, epv_field, C_field, sep_field,
+        widgets.HTML("<b>Y handling</b>"),
+        min_auto, min_field, other_field,
+        widgets.HTML("<b>Checks and imputation</b>"),
+        share_field, thresh_field, n_imp_field, mar_field,
+        widgets.HTML("<b>Bootstrap</b>"),
+        n_boot_field, reselect_box, seed_field,
+        widgets.HTML("<b>Predicted Y per row</b>"),
+        pred_name_field, pred_all_box, pred_probs_box,
+        widgets.HTML("<small>Gives each row the most likely Y, its probability, "
+                     "the probability of the reported Y, and the role of the row "
+                     "(target, holdout, development). Rows in the window are in "
+                     "sample and count as diagnostics.</small>"),
+        widgets.HTML("<b>Saving</b>"),
+        save_field,
+    ])
+    advanced = widgets.Accordion(children=[advanced_content])
+    advanced.set_title(0, "Advanced settings")
+    advanced.selected_index = None
+
+    run_btn = widgets.Button(description="Run model", button_style="success",
+                             layout=widgets.Layout(width="200px"))
+    out = widgets.Output()
+
+    last_set = {}   # defaults set by fill(), to see if the user changed them
+
+    def fill():
+        old_types = {x: m.value for x, m in x_type_menus.items()}
+        old_log = set(log_menu.value)
+        for m in x_type_menus.values():
+            m.close()
+        x_type_menus.clear()
+        if state["filtered"] is None or state["selection"] is None:
+            y_html.value = "Run 'Apply and filter' in step 2 first."
+            for m in (id_menu, date_menu, year_menu, sub_menu, month_menu):
+                m.options = [(none, None)]
+            x_type_box.children = []
+            log_menu.options = []
+            return
+        d, y, xs = state["filtered"], state["selection"]["y"], state["selection"]["xs"]
+        y_html.value = f"y_col: <b>{y}</b> (from step 2)"
+        cols = list(d.columns)
+        options = [(none, None)] + [(str(c), c) for c in cols]
+        for m in (id_menu, date_menu, year_menu, sub_menu, month_menu):
+            old = m.value
+            m.options = options
+            m.value = old if old in cols else None
+        # suggest date and year column the first time; can be changed
+        date_guess = next((c for c in cols
+                           if pd.api.types.is_datetime64_any_dtype(d[c])), None)
+        year_guess = next((c for c in cols
+                           if str(c).lower() in ("year", "aar", "ar", "\u00e5r")), None)
+        if date_menu.value is None and year_menu.value is None:
+            date_menu.value = date_guess
+            year_menu.value = year_guess
+        years = None
+        if date_guess is not None:
+            years = d[date_guess].dt.year.dropna()
+        elif year_guess is not None:
+            years = _as_float(d[year_guess]).dropna()
+        if years is not None and len(years):
+            guess = {"target_year": int(years.max()),
+                     "train_to_year": int(years.max()) - 1,
+                     "train_from_year": int(years.min())}
+            for name, field in (("target_year", target_year_field),
+                                ("train_to_year", to_field),
+                                ("train_from_year", from_field)):
+                # only overwrite if the user has not changed the field
+                if name not in last_set or field.value == last_set[name]:
+                    field.value = guess[name]
+                    last_set[name] = guess[name]
+        rows = [widgets.HTML("<b>X columns from step 2: numeric or categorical</b>")]
+        for x in xs:
+            m = widgets.Dropdown(
+                options=["numeric", "categorical"],
+                value=old_types.get(x, "numeric" if _is_num(d[x]) else "categorical"),
+                layout=widgets.Layout(width="140px"))
+            x_type_menus[x] = m
+            rows.append(widgets.HBox([
+                widgets.Label(str(x), layout=widgets.Layout(width="200px")), m]))
+        x_type_box.children = rows
+        log_menu.options = [(str(x), x) for x in xs]
+        log_menu.value = tuple(x for x in xs if x in old_log)
+
+    def number_list(text, name):
+        try:
+            return [float(v) for v in text.split(",") if v.strip()]
+        except ValueError:
+            raise ValueError(f"{name}: write numbers separated by commas.")
+
+    def read_settings():
+        x_num = [x for x, m in x_type_menus.items() if m.value == "numeric"]
+        x_cat = [x for x, m in x_type_menus.items() if m.value == "categorical"]
+        decays = number_list(decay_field.value, "decay_candidates")
+        Cs = number_list(C_field.value, "C_candidates")
+        if not decays:
+            raise ValueError("decay_candidates cannot be empty.")
+        if not Cs:
+            raise ValueError("C_candidates cannot be empty.")
+        thresh = thresh_field.value.strip()
+        return {
+            "y_col": state["selection"]["y"],
+            "id_col": id_menu.value,
+            "time_source": source_menu.value,
+            "date_col": date_menu.value,
+            "date_format": date_fmt_field.value.strip() or None,
+            "year_col": year_menu.value,
+            "subperiod_col": sub_menu.value,
+            "month_col": month_menu.value,
+            "x_numeric": x_num,
+            "x_categorical": x_cat,
+            "log_cols": list(log_menu.value),
+            "season_as_x": season_box.value,
+            "frequency": freq_menu.value,
+            "target_year": target_year_field.value,
+            "target_subperiod": target_sub_field.value,
+            "train_from_year": from_field.value,
+            "train_to_year": to_field.value,
+            "holdout_periods": holdout_field.value,
+            "n_validation": n_val_field.value,
+            "decay_candidates": decays,
+            "decay_min_gain": decay_gain_field.value,
+            "epv_ridge_limit": epv_field.value,
+            "C_candidates": Cs,
+            "separation_limit": sep_field.value,
+            "min_count": None if min_auto.value else min_field.value,
+            "other_label": other_field.value.strip() or "OTHER",
+            "flag_share": share_field.value,
+            "p_threshold": float(thresh) if thresh else None,
+            "n_imputations": n_imp_field.value,
+            "mar_limit_pp": mar_field.value,
+            "n_bootstrap": n_boot_field.value,
+            "bootstrap_reselect": reselect_box.value,
+            "seed": seed_field.value,
+            "save_dir": save_field.value.strip() or None,
+            "prediction_col": pred_name_field.value.strip() or "predicted_Y",
+            "predict_all_rows": pred_all_box.value,
+            "prediction_all_probs": pred_probs_box.value,
+        }
+
+    def run(b):
+        with out:
+            clear_output()
+            if state["filtered"] is None or state["selection"] is None:
+                print("Run 'Apply and filter' in step 2 first.")
+                return
+            try:
+                s = read_settings()
+            except ValueError as e:
+                print(f"Settings error: {e}")
+                return
+            v = state["selection"]
+            print("Data from step 2:")
+            print(f"  {v['rows_before']} rows before filtering, {v['rows_after']} after.")
+            if v["filters"]:
+                print("  Active filters:")
+                for f in v["filters"]:
+                    print(f"    {f}")
+                print("  The model only covers the rows left after filtering.")
+            else:
+                print("  No active filters.")
+            print(f"  x_numeric = {s['x_numeric']}")
+            print(f"  x_categorical = {s['x_categorical']}")
+            print(f"  log_cols = {s['log_cols']}\n")
+            state["settings"] = s
+            state["predicted"] = None
+            try:
+                state["result"] = fit_multinomial(state["filtered"], s)
+            except ValueError as e:
+                print(f"\nStopped: {e}")
+                return
+            except Exception as e:
+                print(f"\nUnexpected error: {e}")
+                traceback.print_exc()
+                return
+            print("\nDone. Results are in state['result'].")
+            try:
+                state["predicted"] = attach_predictions(state["filtered"], state["result"])
+                new = list(state["result"]["predictions"].columns)
+                print(f"Data with predicted Y is in state['predicted'] "
+                      f"({len(new)} new columns: {new[0]} ...).")
+                print("  For predictions on the unfiltered data: "
+                      "attach_predictions(state['raw'], state['result'])")
+            except ValueError as e:
+                print(f"Could not join predictions to the data: {e}")
+
+    run_btn.on_click(run)
+    state["_callbacks"]["filtered"]["model"] = fill
+    fill()
+
+    state["widgets"]["model"] = {
+        "id_col": id_menu, "time_source": source_menu, "date_col": date_menu,
+        "date_format": date_fmt_field, "year_col": year_menu,
+        "subperiod_col": sub_menu, "month_col": month_menu,
+        "x_type": x_type_menus, "log_cols": log_menu, "season_as_x": season_box,
+        "frequency": freq_menu, "target_year": target_year_field,
+        "target_subperiod": target_sub_field, "train_from_year": from_field,
+        "train_to_year": to_field, "holdout_periods": holdout_field,
+        "n_validation": n_val_field, "decay_candidates": decay_field,
+        "decay_min_gain": decay_gain_field, "epv_ridge_limit": epv_field,
+        "C_candidates": C_field, "separation_limit": sep_field,
+        "min_count_auto": min_auto, "min_count": min_field, "other_label": other_field,
+        "flag_share": share_field, "p_threshold": thresh_field,
+        "n_imputations": n_imp_field, "mar_limit_pp": mar_field,
+        "n_bootstrap": n_boot_field, "bootstrap_reselect": reselect_box,
+        "seed": seed_field, "save_dir": save_field,
+        "prediction_col": pred_name_field, "predict_all_rows": pred_all_box,
+        "prediction_all_probs": pred_probs_box,
+        "run": run_btn, "output": out,
+        "read_settings": read_settings,
+    }
+
+    display(widgets.VBox([
+        widgets.HTML("<b>Step 4: multinomial logit, checks, imputation and bootstrap</b>"),
+        y_html,
+        widgets.HTML("<b>Columns</b>"),
+        id_menu,
+        widgets.HTML("<b>Time</b> (say which time columns exist; frequency is "
+                     "picked below)"),
+        source_menu, date_menu, date_fmt_field, year_menu, sub_menu, month_menu,
+        widgets.HTML("<b>X</b>"),
+        x_type_box, log_menu, season_box,
+        widgets.HTML("<b>Periods</b>"),
+        freq_menu, target_year_field, target_sub_field, from_field, to_field,
+        holdout_field,
+        advanced,
+        run_btn, out,
+    ]))
